@@ -403,3 +403,38 @@ pub unsafe fn co_task_mem_free(ptr: *mut c_void) {
 pub fn is_available() -> bool {
     api().is_ok()
 }
+
+// ── Windows 管道 I/O ──
+
+/// 从管道句柄读取所有数据（阻塞直到管道关闭）
+///
+/// # Safety
+/// `handle` 必须是有效的 Windows 管道句柄
+pub unsafe fn read_pipe_to_string(handle: *mut c_void) -> String {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Storage::FileSystem::ReadFile;
+
+    if handle.is_null() {
+        return String::new();
+    }
+
+    let h = HANDLE(handle);
+
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut bytes_read: u32 = 0;
+
+    loop {
+        let ok = ReadFile(h, Some(&mut buf), Some(&mut bytes_read), None);
+
+        match ok {
+            Ok(()) if bytes_read == 0 => break, // EOF
+            Ok(()) => output.extend_from_slice(&buf[..bytes_read as usize]),
+            Err(_) => break,
+        }
+    }
+
+    let _ = CloseHandle(h);
+
+    String::from_utf8_lossy(&output).to_string()
+}

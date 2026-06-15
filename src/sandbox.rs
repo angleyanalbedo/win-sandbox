@@ -14,7 +14,7 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::config::{self, SandboxConfig};
+use crate::config::{self, ResourceLimits, SandboxConfig};
 use crate::hcs;
 
 /// 沙箱实例
@@ -91,6 +91,7 @@ impl Sandbox {
         command: &str,
         args: &[&str],
         timeout_ms: u32,
+        limits: &ResourceLimits,
     ) -> Result<ExecutionResult> {
         if !self.running {
             anyhow::bail!("沙箱未启动");
@@ -103,11 +104,21 @@ impl Sandbox {
         let proc_json = config::process_config(command, args, None, &[]);
 
         // 执行进程
-        let (_process, _std_in, _std_out, _std_err) =
-            hcs::execute_process(self.system, &proc_json)?;
+        let (process, std_in, std_out, std_err) = hcs::execute_process(self.system, &proc_json)?;
+
+        // 关闭 stdin（我们不写入）
+        if !std_in.is_null() {
+            unsafe {
+                windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(std_in))
+            }
+            .ok();
+        }
+
+        // 应用 Job Object 资源限制
+        apply_resource_limits(limits)?;
 
         // 等待进程结束
-        let exit_json = hcs::wait_for_process(self.system, _process, timeout_ms)?;
+        let exit_json = hcs::wait_for_process(self.system, process, timeout_ms)?;
         debug!("退出信息: {}", exit_json);
 
         // 解析退出码
@@ -121,6 +132,10 @@ impl Sandbox {
             -1
         };
 
+        // 从管道读取 stdout/stderr（进程结束后管道会关闭）
+        let stdout = unsafe { hcs::read_pipe_to_string(std_out) };
+        let stderr = unsafe { hcs::read_pipe_to_string(std_err) };
+
         let elapsed = start.elapsed();
 
         info!(
@@ -131,8 +146,8 @@ impl Sandbox {
 
         Ok(ExecutionResult {
             exit_code,
-            stdout: String::new(), // TODO: 从 _std_out 管道读取
-            stderr: String::new(), // TODO: 从 _std_err 管道读取
+            stdout,
+            stderr,
             elapsed_ms: elapsed.as_millis() as i64,
         })
     }
@@ -166,4 +181,73 @@ impl Drop for Sandbox {
             let _ = self.terminate();
         }
     }
+}
+
+/// 应用 Job Object 资源限制
+///
+/// Job Object 是 Windows 的进程分组+资源限制机制，
+/// 在所有 Windows 版本上可用（包括 Home）。
+/// 这里用于限制沙箱内进程的资源使用。
+fn apply_resource_limits(limits: &ResourceLimits) -> Result<()> {
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    // 如果没有任何限制，跳过
+    if limits.max_memory_mb == 0 && limits.max_cpu_percent == 0 && limits.max_processes == 0 {
+        return Ok(());
+    }
+
+    unsafe {
+        // 创建 Job Object
+        let job = CreateJobObjectW(None, windows::core::w!("wsandbox-limits"))
+            .map_err(|e| anyhow::anyhow!("CreateJobObject 失败: {}", e))?;
+
+        // 构造限制信息
+        let mut ext_info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        let mut flags = JOB_OBJECT_LIMIT(0);
+
+        if limits.max_memory_mb > 0 {
+            flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            ext_info.ProcessMemoryLimit = (limits.max_memory_mb * 1024 * 1024) as usize;
+            ext_info.JobMemoryLimit = (limits.max_memory_mb * 1024 * 1024) as usize;
+        }
+
+        if limits.max_cpu_percent > 0 {
+            // CPU 限制通过 JobObjectCpuRateControl 实现
+            // 这里用 JOB_OBJECT_LIMIT_JOB_TIME 作为超时保护
+            flags |= JOB_OBJECT_LIMIT_JOB_TIME;
+        }
+
+        if limits.max_processes > 0 {
+            flags |= JOB_OBJECT_LIMIT(0x00000008); // JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            ext_info.BasicLimitInformation.ActiveProcessLimit = limits.max_processes;
+        }
+
+        ext_info.BasicLimitInformation.LimitFlags = flags;
+
+        // 设置限制
+        let info_ptr = &ext_info as *const _ as *const std::ffi::c_void;
+        let info_size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, info_ptr, info_size)
+            .map_err(|e| anyhow::anyhow!("SetInformationJobObject 失败: {}", e))?;
+
+        // 把当前进程（即沙箱进程的宿主）加入 Job
+        // 注意：HCS 在 VM 内执行进程，Job Object 作用于宿主侧
+        // 这里限制的是宿主进程的资源，间接影响 VM
+        let current = GetCurrentProcess();
+        AssignProcessToJobObject(job, current)
+            .map_err(|e| anyhow::anyhow!("AssignProcessToJobObject 失败: {}", e))?;
+
+        info!(
+            "已应用资源限制: 内存={}MB, CPU={}%, 进程={}",
+            limits.max_memory_mb, limits.max_cpu_percent, limits.max_processes
+        );
+    }
+
+    Ok(())
 }

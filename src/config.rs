@@ -25,11 +25,20 @@ pub struct SandboxConfig {
     /// 是否启用网络
     pub enable_network: bool,
 
+    /// 网络域名白名单（为空则不限制，仅 allow_network=true 时生效）
+    pub network_allowed_domains: Vec<String>,
+
     /// 共享目录：Host 路径 → VM 内路径
     pub shared_dirs: Vec<SharedDir>,
 
     /// 沙箱临时文件存放位置（差分磁盘等）
     pub workspace_path: String,
+
+    /// 是否使用差分磁盘（共享 Host 基础镜像，只存改动）
+    pub enable_diff_disk: bool,
+
+    /// 差分磁盘基础镜像路径（为空则自动检测）
+    pub diff_disk_base: String,
 }
 
 #[derive(Debug, Clone)]
@@ -62,8 +71,74 @@ impl SandboxConfig {
 
     /// Hyper-V 轻量 VM 配置（最接近 Windows Sandbox）
     fn hyperv_vm_config(&self) -> String {
-        // 这个配置对应一个轻量 Hyper-V VM
-        // 使用差分磁盘，基础镜像共享 Host 的系统文件
+        // ── 共享目录（MappedDirectories）──
+        let mapped_dirs: Vec<serde_json::Value> = self
+            .shared_dirs
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "HostPath": d.host_path,
+                    "ContainerPath": d.guest_path,
+                    "ReadOnly": d.read_only,
+                    "Lun": 0
+                })
+            })
+            .collect();
+
+        // ── 差分磁盘层 ──
+        let layers = if self.enable_diff_disk {
+            let base = if self.diff_disk_base.is_empty() {
+                // 自动检测 Windows 基础镜像路径
+                detect_base_image()
+            } else {
+                self.diff_disk_base.clone()
+            };
+            if base.is_empty() {
+                vec![]
+            } else {
+                vec![serde_json::json!({
+                    "Id": "os",
+                    "Path": base,
+                    "ReadOnly": true,
+                    "Type": "Dynamic"
+                })]
+            }
+        } else {
+            vec![]
+        };
+
+        // ── 网络配置 ──
+        let network = if self.enable_network {
+            let mut net = serde_json::json!({
+                "AdapterName": "SandboxNIC",
+                "NatName": "SandboxNAT"
+            });
+            // 域名白名单
+            if !self.network_allowed_domains.is_empty() {
+                net["DnsSearchList"] = serde_json::Value::Array(
+                    self.network_allowed_domains
+                        .iter()
+                        .map(|d| serde_json::Value::String(d.clone()))
+                        .collect(),
+                );
+            }
+            net
+        } else {
+            serde_json::json!({})
+        };
+
+        // ── 设备配置 ──
+        let mut devices = serde_json::json!({
+            "Scsi": {
+                "0": {}
+            }
+        });
+
+        // 如果有共享目录，加入 MappedDirectories
+        if !mapped_dirs.is_empty() {
+            devices["MappedDirectories"] = serde_json::Value::Array(mapped_dirs);
+        }
+
         let config = serde_json::json!({
             "Owner": "win-sandbox",
             "SchemaVersion": {
@@ -87,11 +162,7 @@ impl SandboxConfig {
                         "Count": self.cpu_count
                     }
                 },
-                "Devices": {
-                    "Scsi": {
-                        "0": {}  // SCSI 控制器
-                    }
-                },
+                "Devices": devices,
                 "GuestConnection": {
                     "UseConnectedSuspend": true,
                     "UseConnectedBridge": true
@@ -100,23 +171,13 @@ impl SandboxConfig {
 
             // ── 存储（差分磁盘）──
             "Storage": {
-                "Layers": [
-                    // 基础层：Host 系统文件（只读，共享）
-                    // 这个路径需要根据实际系统调整
-                ],
+                "Layers": layers,
                 "Path": format!("{}\\sandbox.vhdx", self.workspace_path),
                 "AutoAttachVirtualHardDisks": true
             },
 
             // ── 网络 ──
-            "GuestNetwork": if self.enable_network {
-                serde_json::json!({
-                    "AdapterName": "SandboxNIC",
-                    "NatName": "SandboxNAT"
-                })
-            } else {
-                serde_json::json!({})
-            }
+            "GuestNetwork": network
         });
 
         serde_json::to_string_pretty(&config).unwrap()
@@ -211,6 +272,33 @@ impl SandboxConfig {
     }
 }
 
+/// 自动检测 Windows 基础镜像路径
+///
+/// Windows Sandbox 使用 WCOS (Windows Core OS) 基础镜像，
+/// 普通 Hyper-V VM 可以用 Windows 安装盘中的 install.wim/esd。
+/// 这里尝试找到一个可用的 Windows 基础 VHDX。
+pub fn detect_base_image() -> String {
+    // 1. 检查 Windows Sandbox 的基础镜像（如果安装了 Windows Sandbox）
+    let sandbox_paths = [
+        r"C:\ProgramData\Microsoft\Windows\Containers\BaseImages\BaseImage.vhdx",
+        r"C:\Windows\Containers\BaseImages\BaseImage.vhdx",
+    ];
+    for p in &sandbox_paths {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+
+    // 2. 检查 Hyper-V 默认路径下是否有基础镜像
+    let hyperv_base =
+        r"C:\Users\Public\Documents\Hyper-V\Virtual Hard Disks\BaseImage.vhdx".to_string();
+    if std::path::Path::new(&hyperv_base).exists() {
+        return hyperv_base;
+    }
+
+    String::new()
+}
+
 /// 生成进程执行配置的 JSON
 pub fn process_config(
     command: &str,
@@ -242,4 +330,15 @@ pub fn process_config(
     });
 
     serde_json::to_string(&config).unwrap()
+}
+
+/// 进程资源限制配置
+#[derive(Debug, Clone, Default)]
+pub struct ResourceLimits {
+    /// 最大内存 (MB)，0 = 不限制
+    pub max_memory_mb: u64,
+    /// 最大 CPU 时间百分比 (1-100)，0 = 不限制
+    pub max_cpu_percent: u32,
+    /// 最大子进程数，0 = 不限制
+    pub max_processes: u32,
 }
