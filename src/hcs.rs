@@ -104,10 +104,8 @@ type FnHcsGetProcessProperties = unsafe extern "system" fn(
     properties: *mut *mut u16,
 ) -> i32;
 
-type FnHcsCreateOperation = unsafe extern "system" fn(
-    context: *mut c_void,
-    callback: HcsEventCallback,
-) -> HcsOperation;
+type FnHcsCreateOperation =
+    unsafe extern "system" fn(context: *mut c_void, callback: HcsEventCallback) -> HcsOperation;
 
 type FnHcsCloseOperation = unsafe extern "system" fn(operation: HcsOperation);
 
@@ -148,9 +146,15 @@ unsafe impl Send for HcsApi {}
 unsafe impl Sync for HcsApi {}
 
 /// 从 DLL 中获取函数指针
-unsafe fn get_proc<F: Copy>(lib: windows::Win32::Foundation::HMODULE, name: &str) -> anyhow::Result<F> {
+unsafe fn get_proc<F: Copy>(
+    lib: windows::Win32::Foundation::HMODULE,
+    name: &str,
+) -> anyhow::Result<F> {
     let name_c = std::ffi::CString::new(name)?;
-    let addr = windows::Win32::System::LibraryLoader::GetProcAddress(lib, windows::core::PCSTR(name_c.as_ptr() as _));
+    let addr = windows::Win32::System::LibraryLoader::GetProcAddress(
+        lib,
+        windows::core::PCSTR(name_c.as_ptr() as _),
+    );
     match addr {
         Some(f) => Ok(std::mem::transmute_copy(&f)),
         None => anyhow::bail!("vmcompute.dll 缺少函数: {}", name),
@@ -186,9 +190,8 @@ fn load_hcs_api() -> anyhow::Result<HcsApi> {
 }
 
 /// 全局 API 实例（懒加载，只加载一次）
-static HCS: LazyLock<anyhow::Result<HcsApi, String>> = LazyLock::new(|| {
-    load_hcs_api().map_err(|e| e.to_string())
-});
+static HCS: LazyLock<anyhow::Result<HcsApi, String>> =
+    LazyLock::new(|| load_hcs_api().map_err(|e| e.to_string()));
 
 /// 获取 HCS API 实例
 fn api() -> anyhow::Result<&'static HcsApi> {
@@ -198,10 +201,7 @@ fn api() -> anyhow::Result<&'static HcsApi> {
 // ── 公开的安全封装 ──
 
 /// 创建一个新的计算系统（VM 或容器）
-pub fn create_compute_system(
-    id: &str,
-    config: &str,
-) -> anyhow::Result<(HcsSystem, HcsOperation)> {
+pub fn create_compute_system(id: &str, config: &str) -> anyhow::Result<(HcsSystem, HcsOperation)> {
     let api = api()?;
     let id_wide = to_wide(id);
     let config_wide = to_wide(config);
@@ -238,9 +238,7 @@ pub fn start_compute_system(system: HcsSystem) -> anyhow::Result<()> {
     let start_op = create_operation()?;
     let options = to_wide("{}");
 
-    let hr = unsafe {
-        (api.HcsStartComputeSystem)(system, start_op, options.as_ptr())
-    };
+    let hr = unsafe { (api.HcsStartComputeSystem)(system, start_op, options.as_ptr()) };
 
     if hr != 0 {
         unsafe { (api.HcsCloseOperation)(start_op) };
@@ -341,9 +339,7 @@ pub fn terminate_compute_system(system: HcsSystem) -> anyhow::Result<()> {
     let op = create_operation()?;
     let options = to_wide("{}");
 
-    let hr = unsafe {
-        (api.HcsTerminateComputeSystem)(system, op, options.as_ptr())
-    };
+    let hr = unsafe { (api.HcsTerminateComputeSystem)(system, op, options.as_ptr()) };
 
     if hr != 0 {
         log::warn!("HcsTerminateComputeSystem 返回: 0x{:08X}", hr as u32);

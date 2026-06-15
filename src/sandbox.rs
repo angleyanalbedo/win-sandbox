@@ -113,9 +113,7 @@ impl Sandbox {
         // 解析退出码
         let exit_code = if !exit_json.is_empty() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&exit_json) {
-                v["ProcessStatus"]["ExitCode"]
-                    .as_i64()
-                    .unwrap_or(-1) as i32
+                v["ProcessStatus"]["ExitCode"].as_i64().unwrap_or(-1) as i32
             } else {
                 -1
             }

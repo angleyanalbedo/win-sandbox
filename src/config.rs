@@ -6,7 +6,6 @@
 //! 配置 Schema 参考:
 //! https://learn.microsoft.com/en-us/virtualization/api/hcs/resourceschemaversion2
 
-
 /// 沙箱配置
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

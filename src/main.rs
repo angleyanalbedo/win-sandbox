@@ -208,11 +208,7 @@ fn cmd_run(args: cmd_run::RunArgs) -> Result<()> {
     let exe_str = args.exe.to_string_lossy().to_string();
     let arg_refs: Vec<&str> = args.args.iter().map(|s| s.as_str()).collect();
 
-    let result = sandbox.execute(
-        &exe_str,
-        &arg_refs,
-        (args.timeout * 1000) as u32,
-    )?;
+    let result = sandbox.execute(&exe_str, &arg_refs, (args.timeout * 1000) as u32)?;
 
     // 8. 输出结果
     if args.json {
@@ -238,11 +234,7 @@ fn cmd_run(args: cmd_run::RunArgs) -> Result<()> {
         } else {
             format!("✗ 退出码 {}", result.exit_code).red()
         };
-        eprintln!(
-            "{} | 耗时 {}ms",
-            status,
-            result.elapsed_ms
-        );
+        eprintln!("{} | 耗时 {}ms", status, result.elapsed_ms);
     }
 
     // 9. 销毁沙箱（Drop 会自动调用 terminate）
@@ -319,10 +311,7 @@ fn cmd_check() -> Result<()> {
             }
         }
         Err(_) => {
-            eprintln!(
-                "{} Hyper-V: 无法检测（可能需要管理员权限）",
-                "!".yellow()
-            );
+            eprintln!("{} Hyper-V: 无法检测（可能需要管理员权限）", "!".yellow());
         }
     }
 
