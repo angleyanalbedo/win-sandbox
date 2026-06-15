@@ -185,7 +185,8 @@ impl SandboxConfig {
 
     /// Windows 容器配置
     fn windows_container_config(&self) -> String {
-        let layers: Vec<serde_json::Value> = self
+        // 共享目录作为挂载层
+        let mount_layers: Vec<serde_json::Value> = self
             .shared_dirs
             .iter()
             .map(|d| {
@@ -195,6 +196,19 @@ impl SandboxConfig {
                 })
             })
             .collect();
+
+        // 自动检测容器基础镜像层
+        let base_layers = detect_container_layers();
+        let mut all_layers: Vec<serde_json::Value> = base_layers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "Path": p,
+                    "ReadOnly": true
+                })
+            })
+            .collect();
+        all_layers.extend(mount_layers);
 
         let config = serde_json::json!({
             "Owner": "win-sandbox",
@@ -212,7 +226,7 @@ impl SandboxConfig {
                     "EnableHostNetworkAccess": self.enable_network
                 },
                 "Storage": {
-                    "Layers": layers
+                    "Layers": all_layers
                 }
             },
 
@@ -233,6 +247,9 @@ impl SandboxConfig {
 
     /// Linux 容器配置（通过 WSL2 的 Hyper-V 后端）
     fn linux_container_config(&self) -> String {
+        // 自动检测 WSL2 内核路径
+        let kernel_path = detect_wsl_kernel();
+
         let config = serde_json::json!({
             "Owner": "win-sandbox",
             "SchemaVersion": {
@@ -252,7 +269,7 @@ impl SandboxConfig {
                 "StopOnReset": true,
                 "Chipset": {
                     "LinuxKernelDirect": {
-                        "KernelFilePath": "",  // WSL2 内核路径
+                        "KernelFilePath": kernel_path,
                         "InitRdPath": "",
                         "KernelBootOptions": "8250_core.nr_uarts=0"
                     }
@@ -296,7 +313,160 @@ pub fn detect_base_image() -> String {
         return hyperv_base;
     }
 
+    // 3. 检查 Hyper-V 默认目录下是否有任何 .vhdx 文件
+    let hyperv_dir = r"C:\Users\Public\Documents\Hyper-V\Virtual Hard Disks";
+    if let Ok(entries) = std::fs::read_dir(hyperv_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "vhdx") {
+                return path.to_string_lossy().to_string();
+            }
+        }
+    }
+
     String::new()
+}
+
+/// 自动检测 Windows 容器基础镜像层路径
+///
+/// 安装 Windows Containers 功能后，系统会自带基础镜像层。
+/// 这些镜像层存储在 ProgramData\Microsoft\Windows\Containers\BaseImages 下。
+pub fn detect_container_layers() -> Vec<String> {
+    let mut layers = Vec::new();
+
+    // 1. 检查标准容器基础镜像路径
+    let base_paths = [
+        r"C:\ProgramData\Microsoft\Windows\Containers\BaseImages",
+        r"C:\ProgramData\Microsoft\Windows\Containers\BaseImages\WCOS",
+    ];
+
+    for base_dir in &base_paths {
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // 查找 .vhdx 文件或以 Layers 命名的目录
+                if path.extension().is_some_and(|e| e == "vhdx") {
+                    layers.push(path.to_string_lossy().to_string());
+                }
+                // 检查子目录中的 Layers
+                if path.is_dir() {
+                    let layers_dir = path.join("Layers");
+                    if layers_dir.exists() {
+                        if let Ok(layer_entries) = std::fs::read_dir(&layers_dir) {
+                            for layer_entry in layer_entries.flatten() {
+                                let layer_path = layer_entry.path();
+                                if layer_path.extension().is_some_and(|e| e == "vhdx") {
+                                    layers.push(layer_path.to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 检查 Docker Desktop 的 Windows 容器镜像
+    let docker_paths = [
+        r"C:\ProgramData\Docker\windowsfilter",
+        r"C:\ProgramData\DockerDesktop\vm-data",
+    ];
+    for docker_dir in &docker_paths {
+        if let Ok(entries) = std::fs::read_dir(docker_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Docker 的镜像层目录里通常有 Layer.vhdx
+                    let layer_vhdx = path.join("Layer.vhdx");
+                    if layer_vhdx.exists() {
+                        layers.push(layer_vhdx.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    layers
+}
+
+/// 自动检测 WSL2 内核路径
+pub fn detect_wsl_kernel() -> String {
+    // 1. Windows 内置的 WSL2 内核
+    let builtin_paths = [
+        r"C:\Windows\System32\lxss\tools\kernel",
+        r"C:\Windows\System32\lxss\tools\kernel.efi",
+    ];
+    for p in &builtin_paths {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+
+    // 2. Microsoft Store 版 WSL2 的内核
+    let store_paths = [
+        r"C:\Program Files\WSL\microsoft.kernel",
+        r"C:\Program Files\WSL\kernel",
+    ];
+    for p in &store_paths {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+
+    // 3. 搜索 WSL 安装目录下的 kernel 文件
+    let wsl_dir = r"C:\Program Files\WSL";
+    if let Ok(entries) = std::fs::read_dir(wsl_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.contains("kernel") {
+                return entry.path().to_string_lossy().to_string();
+            }
+        }
+    }
+
+    String::new()
+}
+
+/// 检查各种组件的可用性，返回描述信息
+pub fn check_components() -> Vec<ComponentStatus> {
+    let mut statuses = Vec::new();
+
+    // Hyper-V VM 基础镜像
+    let base = detect_base_image();
+    statuses.push(ComponentStatus {
+        name: "Hyper-V VM 基础镜像".to_string(),
+        available: !base.is_empty(),
+        path: base,
+        mode: "hyperv".to_string(),
+    });
+
+    // 容器基础镜像
+    let container_layers = detect_container_layers();
+    statuses.push(ComponentStatus {
+        name: "容器基础镜像".to_string(),
+        available: !container_layers.is_empty(),
+        path: container_layers.first().cloned().unwrap_or_default(),
+        mode: "container".to_string(),
+    });
+
+    // WSL2 内核
+    let kernel = detect_wsl_kernel();
+    statuses.push(ComponentStatus {
+        name: "WSL2 内核".to_string(),
+        available: !kernel.is_empty(),
+        path: kernel,
+        mode: "linux".to_string(),
+    });
+
+    statuses
+}
+
+/// 组件状态
+pub struct ComponentStatus {
+    pub name: String,
+    pub available: bool,
+    pub path: String,
+    pub mode: String,
 }
 
 /// 生成进程执行配置的 JSON

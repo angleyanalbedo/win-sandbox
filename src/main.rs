@@ -481,12 +481,34 @@ fn cmd_check() -> Result<()> {
         eprintln!("{} vmcompute.dll: 无法加载", "✗".red());
     }
 
-    // 6. 差分磁盘基础镜像
-    let base = config::detect_base_image();
-    if base.is_empty() {
-        eprintln!("{} 差分磁盘基础镜像: 未找到", "!".yellow());
-    } else {
-        eprintln!("{} 差分磁盘基础镜像: {}", "✓".green(), base);
+    // 6. 各模式可用性
+    eprintln!();
+    eprintln!("{}", "── 沙箱模式可用性 ──".bold());
+    eprintln!();
+
+    let components = config::check_components();
+    let mut any_available = false;
+    for comp in &components {
+        if comp.available {
+            any_available = true;
+            eprintln!(
+                "{} [{}] {} → {}",
+                "✓".green(),
+                comp.mode,
+                comp.name,
+                comp.path.dimmed()
+            );
+        } else {
+            eprintln!("{} [{}] {}: 未找到资源", "!".yellow(), comp.mode, comp.name);
+        }
+    }
+
+    if !any_available {
+        eprintln!();
+        eprintln!("{} 所有模式都缺少资源，需要准备镜像：", "✗".red());
+        eprintln!("  hyperv   → 需要 Windows VHDX 镜像（放到 Hyper-V 默认目录）");
+        eprintln!("  container → 需要安装容器功能 (dism /enable-feature /featurename:Containers)");
+        eprintln!("  linux    → 需要 WSL2 (wsl --install)");
     }
 
     eprintln!();
