@@ -117,7 +117,7 @@ fn main() -> Result<()> {
             share,
             sandbox_type,
             json,
-            verbose,
+            _verbose: verbose,
         }),
 
         Commands::ShowConfig {
@@ -142,7 +142,7 @@ mod cmd_run {
         pub share: Vec<String>,
         pub sandbox_type: String,
         pub json: bool,
-        pub verbose: bool,
+        pub _verbose: bool,
     }
 }
 

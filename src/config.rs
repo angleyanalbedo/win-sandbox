@@ -6,11 +6,10 @@
 //! 配置 Schema 参考:
 //! https://learn.microsoft.com/en-us/virtualization/api/hcs/resourceschemaversion2
 
-use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// 沙箱配置
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SandboxConfig {
     /// 沙箱名称（用于标识）
     pub name: String,
@@ -45,6 +44,7 @@ pub enum SandboxType {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SharedDir {
     pub host_path: String,
     pub guest_path: String,

@@ -11,10 +11,10 @@
 //! 5. HcsTerminateComputeSystem → 销毁 VM（一次性）
 
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::config::{self, SandboxConfig, SandboxType};
+use crate::config::{self, SandboxConfig};
 use crate::hcs;
 
 /// 沙箱实例
@@ -41,6 +41,17 @@ pub struct ExecutionResult {
 impl Sandbox {
     /// 创建一个新的沙箱实例
     pub fn new(config: SandboxConfig) -> Result<Self> {
+        // 先检查 vmcompute.dll 是否可用
+        if !hcs::is_available() {
+            anyhow::bail!(
+                "vmcompute.dll 不可用。\n\
+                 请确认：\n\
+                 1. Windows 版本为 Pro/Enterprise（Home 版不支持 Hyper-V）\n\
+                 2. Hyper-V 功能已启用\n\
+                 3. vmcompute 服务正在运行"
+            );
+        }
+
         let id = format!("sandbox-{}", Uuid::new_v4());
         info!("创建沙箱: {} ({:?})", id, config.sandbox_type);
 
@@ -62,63 +73,12 @@ impl Sandbox {
         let hcs_json = self.config.to_hcs_json();
         debug!("HCS 配置:\n{}", hcs_json);
 
-        let id_wide = hcs::to_wide(&self.id);
-        let config_wide = hcs::to_wide(&hcs_json);
+        // 创建并等待计算系统
+        let (system, _op) = hcs::create_compute_system(&self.id, &hcs_json)?;
+        self.system = system;
 
-        // 1. 创建异步操作
-        let op = hcs::create_operation()?;
-
-        // 2. 创建计算系统
-        let hr = unsafe {
-            hcs::HcsCreateComputeSystem(
-                id_wide.as_ptr(),
-                config_wide.as_ptr(),
-                op,
-                std::ptr::null(),
-                &mut self.system,
-            )
-        };
-
-        if hr != 0 {
-            unsafe { hcs::HcsCloseOperation(op) };
-            anyhow::bail!("HcsCreateComputeSystem 失败: HRESULT 0x{:08X}", hr as u32);
-        }
-
-        // 3. 等待创建完成
-        let wait_hr = hcs::wait_operation(op, 30_000)?;
-        unsafe { hcs::HcsCloseOperation(op) };
-
-        if wait_hr != 0 {
-            anyhow::bail!(
-                "等待系统创建完成失败: HRESULT 0x{:08X}",
-                wait_hr as u32
-            );
-        }
-
-        // 4. 启动系统
-        let start_op = hcs::create_operation()?;
-        let start_options = hcs::to_wide("{}");
-
-        let hr = unsafe {
-            hcs::HcsStartComputeSystem(
-                self.system,
-                start_op,
-                start_options.as_ptr(),
-            )
-        };
-
-        if hr != 0 {
-            unsafe { hcs::HcsCloseOperation(start_op) };
-            anyhow::bail!("HcsStartComputeSystem 失败: HRESULT 0x{:08X}", hr as u32);
-        }
-
-        // 5. 等待启动完成
-        let wait_hr = hcs::wait_operation(start_op, 60_000)?;
-        unsafe { hcs::HcsCloseOperation(start_op) };
-
-        if wait_hr != 0 {
-            anyhow::bail!("等待系统启动完成失败");
-        }
+        // 启动计算系统
+        hcs::start_compute_system(self.system)?;
 
         self.running = true;
         info!("沙箱启动成功: {}", self.id);
@@ -139,64 +99,19 @@ impl Sandbox {
         let start = std::time::Instant::now();
         info!("执行进程: {} {:?}", command, args);
 
-        // 1. 构造进程配置 JSON
+        // 构造进程配置 JSON
         let proc_json = config::process_config(command, args, None, &[]);
-        let proc_wide = hcs::to_wide(&proc_json);
 
-        // 2. 创建操作
-        let op = hcs::create_operation()?;
+        // 执行进程
+        let (_process, _std_in, _std_out, _std_err) =
+            hcs::execute_process(self.system, &proc_json)?;
 
-        // 3. 执行进程
-        let mut process: hcs::HcsProcess = std::ptr::null_mut();
-        let mut std_in: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut std_out: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut std_err: *mut std::ffi::c_void = std::ptr::null_mut();
+        // 等待进程结束
+        let exit_json = hcs::wait_for_process(self.system, _process, timeout_ms)?;
+        debug!("退出信息: {}", exit_json);
 
-        let hr = unsafe {
-            hcs::HcsExecuteProcess(
-                self.system,
-                proc_wide.as_ptr(),
-                op,
-                &mut process,
-                &mut std_in,
-                &mut std_out,
-                &mut std_err,
-            )
-        };
-
-        if hr != 0 {
-            unsafe { hcs::HcsCloseOperation(op) };
-            anyhow::bail!("HcsExecuteProcess 失败: 0x{:08X}", hr as u32);
-        }
-
-        // 4. 等待进程执行启动完成
-        let wait_hr = hcs::wait_operation(op, 10_000)?;
-        unsafe { hcs::HcsCloseOperation(op) };
-
-        if wait_hr != 0 {
-            anyhow::bail!("等待进程启动失败");
-        }
-
-        // 5. 等待进程结束
-        let wait_op = hcs::create_operation()?;
-        let mut exit_info_ptr: *mut u16 = std::ptr::null_mut();
-
-        let hr = unsafe {
-            hcs::HcsWaitForProcessInComputeSystem(
-                self.system,
-                process,
-                timeout_ms,
-                wait_op,
-                &mut exit_info_ptr,
-            )
-        };
-
-        // 6. 解析退出信息
-        let exit_code = if !exit_info_ptr.is_null() {
-            let exit_json = unsafe { hcs::u16_ptr_to_string(exit_info_ptr) };
-            debug!("退出信息: {}", exit_json);
-
-            // 解析 JSON 获取退出码
+        // 解析退出码
+        let exit_code = if !exit_json.is_empty() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&exit_json) {
                 v["ProcessStatus"]["ExitCode"]
                     .as_i64()
@@ -208,13 +123,6 @@ impl Sandbox {
             -1
         };
 
-        unsafe {
-            hcs::HcsCloseOperation(wait_op);
-            if !exit_info_ptr.is_null() {
-                crate::hcs::CoTaskMemFree(exit_info_ptr as *mut std::ffi::c_void);
-            }
-        }
-
         let elapsed = start.elapsed();
 
         info!(
@@ -225,8 +133,8 @@ impl Sandbox {
 
         Ok(ExecutionResult {
             exit_code,
-            stdout: String::new(), // TODO: 从 std_out 管道读取
-            stderr: String::new(), // TODO: 从 std_err 管道读取
+            stdout: String::new(), // TODO: 从 _std_out 管道读取
+            stderr: String::new(), // TODO: 从 _std_err 管道读取
             elapsed_ms: elapsed.as_millis() as i64,
         })
     }
@@ -239,24 +147,7 @@ impl Sandbox {
 
         info!("销毁沙箱: {}", self.id);
 
-        let op = hcs::create_operation()?;
-        let options = hcs::to_wide("{}");
-
-        let hr = unsafe {
-            hcs::HcsTerminateComputeSystem(
-                self.system,
-                op,
-                options.as_ptr(),
-            )
-        };
-
-        if hr != 0 {
-            warn!("HcsTerminateComputeSystem 返回: 0x{:08X}", hr as u32);
-        }
-
-        // 等待销毁完成
-        let _ = hcs::wait_operation(op, 30_000);
-        unsafe { hcs::HcsCloseOperation(op) };
+        hcs::terminate_compute_system(self.system)?;
 
         self.running = false;
         self.system = std::ptr::null_mut();
