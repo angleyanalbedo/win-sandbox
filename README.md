@@ -118,6 +118,25 @@ win-sandbox/
    → 什么都不留
 ```
 
+### 开发路线
+
+**v0.1（当前）**
+- HCS API FFI 绑定
+- VM 生命周期管理（创建→启动→执行→销毁）
+- 三种沙箱模式配置（HyperV / Container / Linux）
+- 环境检测（check 命令）
+
+**v0.2（计划中）**
+- stdout/stderr 管道捕获（通过 Named Pipe 连接 HcsExecuteProcess 返回的 I/O 句柄）
+- 差分磁盘支持（共享 Host 基础镜像，只存 Guest 改动）
+- 共享目录挂载（Host 目录 → VM 内路径）
+- 网络控制（域名白名单 / 完全禁止）
+
+**v0.3（计划中）**
+- 与 wasmtime-agent-sandbox 统一 CLI 入口
+- 策略文件复用（同一份 YAML 配置 Wasm 和 VM 两种模式）
+- 审计日志对接
+
 ### 参考
 
 - [hcsshim](https://github.com/microsoft/hcsshim) — 微软官方的 HCS Go 绑定（Apache-2.0）
@@ -130,3 +149,7 @@ win-sandbox/
 - 需要管理员权限
 - HCS API 不在公开 Win32 文档中，Schema 可能随 Windows 版本变化
 - stdout/stderr 管道捕获需要额外实现（当前版本仅获取退出码）
+
+### License
+
+MIT
