@@ -62,6 +62,15 @@ func cmdCheck() error {
 		fmt.Println("  dism /online /enable-feature /featurename:Microsoft-Hyper-V /All")
 	}
 
+	// HCS API 状态
+	fmt.Println()
+	fmt.Println("=== HCS API 状态 ===")
+	fmt.Println()
+	apiStatus := sandbox.HCSAPIStatus()
+	for name, ok := range apiStatus {
+		printCheck(name, ok)
+	}
+
 	// 诊断信息
 	fmt.Println()
 	fmt.Println("=== 诊断信息 ===")

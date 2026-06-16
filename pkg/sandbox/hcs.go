@@ -3,40 +3,40 @@ package sandbox
 import (
 	"encoding/json"
 	"fmt"
-	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/windows"
 )
 
 var (
-	modVMCompute = syscall.NewLazyDLL("vmcompute.dll")
-	modOle32     = syscall.NewLazyDLL("ole32.dll")
+	modVMCompute   = windows.NewLazyDLL("vmcompute.dll")
+	modComputeCore = windows.NewLazyDLL("computecore.dll")
 
-	procHcsCreateComputeSystem            = modVMCompute.NewProc("HcsCreateComputeSystem")
-	procHcsStartComputeSystem             = modVMCompute.NewProc("HcsStartComputeSystem")
-	procHcsTerminateComputeSystem         = modVMCompute.NewProc("HcsTerminateComputeSystem")
-	procHcsCreateOperation                = modVMCompute.NewProc("HcsCreateOperation")
-	procHcsCloseOperation                 = modVMCompute.NewProc("HcsCloseOperation")
-	procHcsWaitForOperationResult         = modVMCompute.NewProc("HcsWaitForOperationResult")
-	procHcsCreateProcess                  = modVMCompute.NewProc("HcsCreateProcess")
-	procHcsWaitForProcessInComputeSystem  = modVMCompute.NewProc("HcsWaitForProcessInComputeSystem")
-	procHcsGetProcessProperties           = modVMCompute.NewProc("HcsGetProcessProperties")
-	procCoTaskMemFree                     = modOle32.NewProc("CoTaskMemFree")
+	// 必需函数
+	procHcsCreateComputeSystem    = getProc("HcsCreateComputeSystem")
+	procHcsStartComputeSystem     = getProc("HcsStartComputeSystem")
+	procHcsTerminateComputeSystem = getProc("HcsTerminateComputeSystem")
+	procHcsCreateProcess          = getProc("HcsCreateProcess")
 
-	// 尝试 computecore.dll（新版 Windows 拆分了部分函数到这里）
-	modComputeCore = syscall.NewLazyDLL("computecore.dll")
+	// 可选函数
+	procHcsCreateOperation               = getProc("HcsCreateOperation")
+	procHcsCloseOperation                = getProc("HcsCloseOperation")
+	procHcsWaitForOperationResult        = getProc("HcsWaitForOperationResult")
+	procHcsWaitForProcessInComputeSystem = getProc("HcsWaitForProcessInComputeSystem")
+	procHcsGetProcessProperties          = getProc("HcsGetProcessProperties")
+
+	hasOperationAPI bool
 )
 
-const (
-	hcsEventOperationCompleted = 3
-	hcsProcessStatistics       = 0
-	waitTimeout                = 30 // 秒
-)
+func init() {
+	hasOperationAPI = procHcsCreateOperation != nil &&
+		procHcsCloseOperation != nil &&
+		procHcsWaitForOperationResult != nil
+}
 
-// getProc 从多个 DLL 中查找函数
-func getProc(name string) *syscall.LazyProc {
+func getProc(name string) *windows.LazyProc {
 	if p := modVMCompute.NewProc(name); p.Find() == nil {
 		return p
 	}
@@ -46,36 +46,37 @@ func getProc(name string) *syscall.LazyProc {
 	return nil
 }
 
-// HCSHandle HCS 句柄类型
 type HCSHandle uintptr
 
-// hcsOperation 结构
 type hcsOperation struct {
 	handle HCSHandle
 }
 
-// createOperation 创建 HCS 操作
-func createOperation() (*hcsOperation, error) {
-	var handle HCSHandle
-	r1, _, err := procHcsCreateOperation.Call(0, 0, uintptr(unsafe.Pointer(&handle)))
-	if r1 != 0 {
-		return nil, fmt.Errorf("HcsCreateOperation 失败: %v", err)
+func createOperation() *hcsOperation {
+	if !hasOperationAPI {
+		return &hcsOperation{handle: 0}
 	}
-	return &hcsOperation{handle: handle}, nil
+	var handle HCSHandle
+	r1, _, _ := procHcsCreateOperation.Call(0, 0, uintptr(unsafe.Pointer(&handle)))
+	if r1 != 0 {
+		return &hcsOperation{handle: 0}
+	}
+	return &hcsOperation{handle: handle}
 }
 
-// close 关闭操作
 func (op *hcsOperation) close() {
-	if op.handle != 0 {
+	if op.handle != 0 && procHcsCloseOperation != nil {
 		procHcsCloseOperation.Call(uintptr(op.handle))
 		op.handle = 0
 	}
 }
 
-// waitForResult 等待操作结果
 func (op *hcsOperation) waitForResult(timeoutSec int) (string, error) {
+	if op.handle == 0 || !hasOperationAPI {
+		return "", nil
+	}
 	var result *uint16
-	timeout := uint32(timeoutSec * 1000) // 转换为毫秒
+	timeout := uint32(timeoutSec * 1000)
 	r1, _, err := procHcsWaitForOperationResult.Call(
 		uintptr(op.handle),
 		uintptr(timeout),
@@ -85,46 +86,51 @@ func (op *hcsOperation) waitForResult(timeoutSec int) (string, error) {
 		return "", fmt.Errorf("HcsWaitForOperationResult 失败: %v", err)
 	}
 	if result != nil {
-		defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(result)))
-		return UTF16PtrToString(result), nil
+		defer windows.CoTaskMemFree(unsafe.Pointer(result))
+		return windows.UTF16PtrToString(result), nil
 	}
 	return "", nil
 }
 
-// CreateComputeSystemV2 使用 HCS v2 JSON 创建 compute system
 func CreateComputeSystemV2(id string, configJSON string) (HCSHandle, error) {
 	logrus.WithField("id", id).Debug("正在创建 compute system (v2)...")
 
-	op, err := createOperation()
-	if err != nil {
-		return 0, err
+	if procHcsCreateComputeSystem == nil {
+		return 0, fmt.Errorf("HcsCreateComputeSystem 不可用")
 	}
+
+	op := createOperation()
 	defer op.close()
 
-	idPtr, err := syscall.UTF16PtrFromString(id)
+	idPtr, err := windows.UTF16PtrFromString(id)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("转换 id 失败: %w", err)
 	}
-	configPtr, err := syscall.UTF16PtrFromString(configJSON)
+	configPtr, err := windows.UTF16PtrFromString(configJSON)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("转换 config 失败: %w", err)
 	}
 
 	var system HCSHandle
-	r1, _, err := procHcsCreateComputeSystem.Call(
+	r1, _, callErr := procHcsCreateComputeSystem.Call(
 		uintptr(unsafe.Pointer(idPtr)),
 		uintptr(unsafe.Pointer(configPtr)),
 		uintptr(op.handle),
-		0, // securityDescriptor
+		0,
 		uintptr(unsafe.Pointer(&system)),
 	)
+
+	logrus.WithFields(logrus.Fields{
+		"r1":       fmt.Sprintf("0x%X", r1),
+		"callErr":  callErr,
+		"system":   system,
+	}).Debug("HcsCreateComputeSystem 返回")
+
 	if r1 != 0 {
-		// 尝试获取详细错误信息
 		result, _ := op.waitForResult(5)
-		return 0, fmt.Errorf("HcsCreateComputeSystem 失败 (HRESULT: 0x%X, %v) - %s", r1, err, result)
+		return 0, fmt.Errorf("HcsCreateComputeSystem 失败 (HRESULT: 0x%X, %v) - %s", r1, callErr, result)
 	}
 
-	// 等待操作完成
 	result, err := op.waitForResult(waitTimeout)
 	if err != nil {
 		return 0, fmt.Errorf("等待创建完成失败: %w", err)
@@ -136,27 +142,32 @@ func CreateComputeSystemV2(id string, configJSON string) (HCSHandle, error) {
 	return system, nil
 }
 
-// StartComputeSystem 启动 compute system
 func StartComputeSystem(system HCSHandle) error {
 	logrus.Debug("正在启动 compute system...")
 
-	op, err := createOperation()
-	if err != nil {
-		return err
+	if procHcsStartComputeSystem == nil {
+		return fmt.Errorf("HcsStartComputeSystem 不可用")
 	}
+
+	op := createOperation()
 	defer op.close()
 
-	r1, _, err := procHcsStartComputeSystem.Call(
+	r1, _, callErr := procHcsStartComputeSystem.Call(
 		uintptr(system),
 		uintptr(op.handle),
-		0, // options
+		0,
 	)
+
+	logrus.WithFields(logrus.Fields{
+		"r1":      fmt.Sprintf("0x%X", r1),
+		"callErr": callErr,
+	}).Debug("HcsStartComputeSystem 返回")
+
 	if r1 != 0 {
 		result, _ := op.waitForResult(5)
-		return fmt.Errorf("HcsStartComputeSystem 失败 (HRESULT: 0x%X, %v) - %s", r1, err, result)
+		return fmt.Errorf("HcsStartComputeSystem 失败 (HRESULT: 0x%X, %v) - %s", r1, callErr, result)
 	}
 
-	// 等待操作完成
 	result, err := op.waitForResult(waitTimeout)
 	if err != nil {
 		return fmt.Errorf("等待启动完成失败: %w", err)
@@ -168,48 +179,46 @@ func StartComputeSystem(system HCSHandle) error {
 	return nil
 }
 
-// TerminateComputeSystem 终止 compute system
 func TerminateComputeSystem(system HCSHandle) error {
 	logrus.Debug("正在终止 compute system...")
 
-	op, err := createOperation()
-	if err != nil {
-		return err
+	if procHcsTerminateComputeSystem == nil {
+		return fmt.Errorf("HcsTerminateComputeSystem 不可用")
 	}
+
+	op := createOperation()
 	defer op.close()
 
-	r1, _, err := procHcsTerminateComputeSystem.Call(
+	r1, _, callErr := procHcsTerminateComputeSystem.Call(
 		uintptr(system),
 		uintptr(op.handle),
-		0, // options
+		0,
 	)
 	if r1 != 0 {
-		return fmt.Errorf("HcsTerminateComputeSystem 失败 (HRESULT: 0x%X, %v)", r1, err)
+		return fmt.Errorf("HcsTerminateComputeSystem 失败 (HRESULT: 0x%X, %v)", r1, callErr)
 	}
 
-	// 等待操作完成
-	_, err = op.waitForResult(waitTimeout)
+	_, err := op.waitForResult(waitTimeout)
 	return err
 }
 
-// CreateProcessV2 使用 v2 API 在 compute system 中创建进程
 func CreateProcessV2(system HCSHandle, processConfigJSON string) (HCSHandle, HCSHandle, HCSHandle, HCSHandle, error) {
 	logrus.Debug("正在创建进程...")
 
-	op, err := createOperation()
-	if err != nil {
-		return 0, 0, 0, 0, err
+	if procHcsCreateProcess == nil {
+		return 0, 0, 0, 0, fmt.Errorf("HcsCreateProcess 不可用")
 	}
+
+	op := createOperation()
 	defer op.close()
 
-	configPtr, err := syscall.UTF16PtrFromString(processConfigJSON)
+	configPtr, err := windows.UTF16PtrFromString(processConfigJSON)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
 
-	var process HCSHandle
-	var stdin, stdout, stderr HCSHandle
-	r1, _, err := procHcsCreateProcess.Call(
+	var process, stdin, stdout, stderr HCSHandle
+	r1, _, callErr := procHcsCreateProcess.Call(
 		uintptr(system),
 		uintptr(unsafe.Pointer(configPtr)),
 		uintptr(op.handle),
@@ -218,12 +227,18 @@ func CreateProcessV2(system HCSHandle, processConfigJSON string) (HCSHandle, HCS
 		uintptr(unsafe.Pointer(&stdout)),
 		uintptr(unsafe.Pointer(&stderr)),
 	)
+
+	logrus.WithFields(logrus.Fields{
+		"r1":      fmt.Sprintf("0x%X", r1),
+		"callErr": callErr,
+		"process": process,
+	}).Debug("HcsCreateProcess 返回")
+
 	if r1 != 0 {
 		result, _ := op.waitForResult(5)
-		return 0, 0, 0, 0, fmt.Errorf("HcsCreateProcess 失败 (HRESULT: 0x%X, %v) - %s", r1, err, result)
+		return 0, 0, 0, 0, fmt.Errorf("HcsCreateProcess 失败 (HRESULT: 0x%X, %v) - %s", r1, callErr, result)
 	}
 
-	// 等待操作完成
 	_, err = op.waitForResult(waitTimeout)
 	if err != nil {
 		return 0, 0, 0, 0, fmt.Errorf("等待进程创建完成失败: %w", err)
@@ -232,19 +247,22 @@ func CreateProcessV2(system HCSHandle, processConfigJSON string) (HCSHandle, HCS
 	return process, stdin, stdout, stderr, nil
 }
 
-// WaitForProcessV2 等待进程退出
 func WaitForProcessV2(system HCSHandle, process HCSHandle, timeout time.Duration) (int, error) {
 	logrus.Debug("正在等待进程退出...")
 
-	op, err := createOperation()
-	if err != nil {
-		return -1, err
+	if procHcsWaitForProcessInComputeSystem != nil {
+		return waitForProcessWithAPI(system, process, timeout)
 	}
+	return waitForProcessPolling(system, process, timeout)
+}
+
+func waitForProcessWithAPI(system HCSHandle, process HCSHandle, timeout time.Duration) (int, error) {
+	op := createOperation()
 	defer op.close()
 
 	timeoutMs := uint32(timeout.Milliseconds())
 	var result *uint16
-	r1, _, err := procHcsWaitForProcessInComputeSystem.Call(
+	r1, _, callErr := procHcsWaitForProcessInComputeSystem.Call(
 		uintptr(system),
 		uintptr(process),
 		uintptr(timeoutMs),
@@ -252,16 +270,14 @@ func WaitForProcessV2(system HCSHandle, process HCSHandle, timeout time.Duration
 		uintptr(unsafe.Pointer(&result)),
 	)
 	if r1 != 0 {
-		return -1, fmt.Errorf("HcsWaitForProcessInComputeSystem 失败 (HRESULT: 0x%X, %v)", r1, err)
+		return -1, fmt.Errorf("HcsWaitForProcessInComputeSystem 失败 (HRESULT: 0x%X, %v)", r1, callErr)
 	}
 
-	// 等待操作完成
 	resultStr, err := op.waitForResult(int(timeout.Seconds()) + 10)
 	if err != nil {
 		return -1, fmt.Errorf("等待进程退出失败: %w", err)
 	}
 
-	// 解析退出码
 	exitCode := -1
 	if resultStr != "" {
 		var parsed struct {
@@ -275,13 +291,51 @@ func WaitForProcessV2(system HCSHandle, process HCSHandle, timeout time.Duration
 	}
 
 	if result != nil {
-		procCoTaskMemFree.Call(uintptr(unsafe.Pointer(result)))
+		windows.CoTaskMemFree(unsafe.Pointer(result))
 	}
 
 	return exitCode, nil
 }
 
-// ReadPipe 从管道句柄读取数据
+func waitForProcessPolling(system HCSHandle, process HCSHandle, timeout time.Duration) (int, error) {
+	if procHcsGetProcessProperties == nil {
+		logrus.Warn("HcsWaitForProcessInComputeSystem 和 HcsGetProcessProperties 都不可用，等待固定时间")
+		time.Sleep(timeout)
+		return -1, nil
+	}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var result *uint16
+		r1, _, _ := procHcsGetProcessProperties.Call(
+			uintptr(system),
+			uintptr(process),
+			uintptr(unsafe.Pointer(&result)),
+		)
+
+		if r1 == 0 && result != nil {
+			resultStr := windows.UTF16PtrToString(result)
+			windows.CoTaskMemFree(unsafe.Pointer(result))
+
+			var parsed struct {
+				ProcessStatus struct {
+					ExitCode int    `json:"ExitCode"`
+					State    string `json:"State"`
+				} `json:"ProcessStatus"`
+			}
+			if jsonErr := json.Unmarshal([]byte(resultStr), &parsed); jsonErr == nil {
+				if parsed.ProcessStatus.State == "Exited" || parsed.ProcessStatus.State == "Terminated" {
+					return parsed.ProcessStatus.ExitCode, nil
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return -1, fmt.Errorf("等待进程退出超时")
+}
+
 func ReadPipe(handle HCSHandle) ([]byte, error) {
 	if handle == 0 {
 		return nil, nil
@@ -292,15 +346,14 @@ func ReadPipe(handle HCSHandle) ([]byte, error) {
 
 	for {
 		var bytesRead uint32
-		err := syscall.ReadFile(
-			syscall.Handle(handle),
+		err := windows.ReadFile(
+			windows.Handle(handle),
 			buf,
 			&bytesRead,
-			nil, // overlapped
+			nil,
 		)
 		if err != nil {
-			// ERROR_BROKEN_PIPE (109) 表示管道已关闭
-			if err == syscall.ERROR_BROKEN_PIPE {
+			if err == windows.ERROR_BROKEN_PIPE {
 				break
 			}
 			return data, fmt.Errorf("读取管道失败: %v", err)
@@ -314,41 +367,40 @@ func ReadPipe(handle HCSHandle) ([]byte, error) {
 	return data, nil
 }
 
-// CloseHandle 关闭句柄
 func CloseHandle(handle HCSHandle) {
 	if handle != 0 {
-		syscall.CloseHandle(syscall.Handle(handle))
+		windows.CloseHandle(windows.Handle(handle))
 	}
 }
 
-// UTF16PtrToString 将 UTF-16 指针转换为 Go 字符串
-func UTF16PtrToString(p *uint16) string {
-	if p == nil {
-		return ""
-	}
-	// 找到字符串结尾
-	end := unsafe.Pointer(p)
-	n := 0
-	for *(*uint16)(end) != 0 {
-		end = unsafe.Pointer(uintptr(end) + 2)
-		n++
-	}
-	return syscall.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(p))[:n:n])
-}
-
-// CheckHCSAPI 检查 HCS API 是否可用
 func CheckHCSAPI() error {
-	if err := procHcsCreateComputeSystem.Find(); err != nil {
-		return fmt.Errorf("HcsCreateComputeSystem 不可用: %v", err)
+	if procHcsCreateComputeSystem == nil {
+		return fmt.Errorf("HcsCreateComputeSystem 不可用，请确保 vmcompute.dll 已加载")
 	}
-	if err := procHcsStartComputeSystem.Find(); err != nil {
-		return fmt.Errorf("HcsStartComputeSystem 不可用: %v", err)
+	if procHcsStartComputeSystem == nil {
+		return fmt.Errorf("HcsStartComputeSystem 不可用")
 	}
-	if err := procHcsTerminateComputeSystem.Find(); err != nil {
-		return fmt.Errorf("HcsTerminateComputeSystem 不可用: %v", err)
+	if procHcsTerminateComputeSystem == nil {
+		return fmt.Errorf("HcsTerminateComputeSystem 不可用")
 	}
-	if err := procHcsCreateProcess.Find(); err != nil {
-		return fmt.Errorf("HcsCreateProcess 不可用: %v", err)
+	if procHcsCreateProcess == nil {
+		return fmt.Errorf("HcsCreateProcess 不可用")
 	}
 	return nil
 }
+
+func HCSAPIStatus() map[string]bool {
+	return map[string]bool{
+		"HcsCreateComputeSystem":           procHcsCreateComputeSystem != nil,
+		"HcsStartComputeSystem":            procHcsStartComputeSystem != nil,
+		"HcsTerminateComputeSystem":        procHcsTerminateComputeSystem != nil,
+		"HcsCreateProcess":                 procHcsCreateProcess != nil,
+		"HcsCreateOperation":               procHcsCreateOperation != nil,
+		"HcsCloseOperation":                procHcsCloseOperation != nil,
+		"HcsWaitForOperationResult":        procHcsWaitForOperationResult != nil,
+		"HcsWaitForProcessInComputeSystem": procHcsWaitForProcessInComputeSystem != nil,
+		"HcsGetProcessProperties":          procHcsGetProcessProperties != nil,
+	}
+}
+
+const waitTimeout = 30
