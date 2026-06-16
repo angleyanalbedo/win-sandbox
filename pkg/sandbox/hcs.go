@@ -3,6 +3,7 @@ package sandbox
 import (
 	"encoding/json"
 	"fmt"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -54,14 +55,17 @@ type hcsOperation struct {
 
 func createOperation() *hcsOperation {
 	if !hasOperationAPI {
+		logrus.Debug("HcsCreateOperation 不可用，使用 NULL 操作")
 		return &hcsOperation{handle: 0}
 	}
-	var handle HCSHandle
-	r1, _, _ := procHcsCreateOperation.Call(0, 0, uintptr(unsafe.Pointer(&handle)))
-	if r1 != 0 {
-		return &hcsOperation{handle: 0}
-	}
-	return &hcsOperation{handle: handle}
+	// HcsCreateOperation 直接返回句柄（不是通过输出参数）
+	// HCS_OPERATION HcsCreateOperation(HCS_CALLBACK callback, void *context);
+	handle, _, callErr := procHcsCreateOperation.Call(0, 0)
+	logrus.WithFields(logrus.Fields{
+		"handle":  fmt.Sprintf("0x%X", handle),
+		"callErr": callErr,
+	}).Debug("HcsCreateOperation 返回")
+	return &hcsOperation{handle: HCSHandle(handle)}
 }
 
 func (op *hcsOperation) close() {
@@ -102,6 +106,8 @@ func CreateComputeSystemV2(id string, configJSON string) (HCSHandle, error) {
 	op := createOperation()
 	defer op.close()
 
+	logrus.WithField("opHandle", op.handle).Debug("操作句柄")
+
 	idPtr, err := windows.UTF16PtrFromString(id)
 	if err != nil {
 		return 0, fmt.Errorf("转换 id 失败: %w", err)
@@ -112,18 +118,31 @@ func CreateComputeSystemV2(id string, configJSON string) (HCSHandle, error) {
 	}
 
 	var system HCSHandle
-	r1, _, callErr := procHcsCreateComputeSystem.Call(
+
+	logrus.WithFields(logrus.Fields{
+		"funcAddr":  fmt.Sprintf("0x%X", procHcsCreateComputeSystem.Addr()),
+		"idPtr":     fmt.Sprintf("0x%X", uintptr(unsafe.Pointer(idPtr))),
+		"configPtr": fmt.Sprintf("0x%X", uintptr(unsafe.Pointer(configPtr))),
+		"opHandle":  fmt.Sprintf("0x%X", uintptr(op.handle)),
+		"systemPtr": fmt.Sprintf("0x%X", uintptr(unsafe.Pointer(&system))),
+	}).Debug("调用参数")
+
+	// 使用 Syscall6 直接调用（与 hcsshim 一致）
+	r1, _, callErr := syscall.Syscall6(
+		procHcsCreateComputeSystem.Addr(),
+		5,
 		uintptr(unsafe.Pointer(idPtr)),
 		uintptr(unsafe.Pointer(configPtr)),
 		uintptr(op.handle),
 		0,
 		uintptr(unsafe.Pointer(&system)),
+		0,
 	)
 
 	logrus.WithFields(logrus.Fields{
 		"r1":       fmt.Sprintf("0x%X", r1),
 		"callErr":  callErr,
-		"system":   system,
+		"system":   fmt.Sprintf("0x%X", system),
 	}).Debug("HcsCreateComputeSystem 返回")
 
 	if r1 != 0 {
