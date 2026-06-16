@@ -306,7 +306,18 @@ pub fn detect_base_image() -> String {
         }
     }
 
-    // 2. 检查 Hyper-V 默认路径下是否有基础镜像
+    // 2. 搜索 ContainerStorages 下的 sandbox.vhdx（Windows Sandbox 功能安装后生成）
+    let container_storages = r"C:\ProgramData\Microsoft\Windows\Containers\ContainerStorages";
+    if let Ok(entries) = std::fs::read_dir(container_storages) {
+        for entry in entries.flatten() {
+            let vhdx = entry.path().join("sandbox.vhdx");
+            if vhdx.exists() {
+                return vhdx.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // 3. 检查 Hyper-V 默认路径下是否有基础镜像
     let hyperv_base =
         r"C:\Users\Public\Documents\Hyper-V\Virtual Hard Disks\BaseImage.vhdx".to_string();
     if std::path::Path::new(&hyperv_base).exists() {

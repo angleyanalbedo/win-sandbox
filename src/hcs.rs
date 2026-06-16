@@ -165,8 +165,15 @@ unsafe fn get_proc<F: Copy>(
 fn load_hcs_api() -> anyhow::Result<HcsApi> {
     use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
-    let lib = unsafe { LoadLibraryW(windows::core::w!("vmcompute.dll")) }
-        .map_err(|e| anyhow::anyhow!("无法加载 vmcompute.dll: {} (Hyper-V 可能未启用)", e))?;
+    // 先尝试完整路径，再尝试系统搜索
+    let lib = unsafe { LoadLibraryW(windows::core::w!("C:\\Windows\\System32\\vmcompute.dll")) }
+        .or_else(|_| unsafe { LoadLibraryW(windows::core::w!("vmcompute.dll")) })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "无法加载 vmcompute.dll: {}\n  尝试路径: C:\\Windows\\System32\\vmcompute.dll\n  请确认 Hyper-V 功能已启用，且 vmcompute 服务正在运行",
+                e
+            )
+        })?;
 
     unsafe {
         Ok(HcsApi {
