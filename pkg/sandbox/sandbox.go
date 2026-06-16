@@ -2,11 +2,9 @@ package sandbox
 
 import (
 	"fmt"
-	"io"
 	"sync"
 	"time"
 
-	"github.com/Microsoft/hcsshim"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 )
@@ -21,11 +19,11 @@ type ExecutionResult struct {
 
 // Sandbox 沙箱实例
 type Sandbox struct {
-	id        string
-	config    *SandboxConfig
-	container hcsshim.Container
-	running   bool
-	mu        sync.Mutex
+	id       string
+	config   *SandboxConfig
+	system   HCSHandle
+	running  bool
+	mu       sync.Mutex
 }
 
 // New 创建新的沙箱实例
@@ -48,26 +46,34 @@ func (s *Sandbox) Start() error {
 		return fmt.Errorf("沙箱已在运行中")
 	}
 
+	// 检查 HCS API 可用性
+	if err := CheckHCSAPI(); err != nil {
+		return fmt.Errorf("HCS API 不可用: %w", err)
+	}
+
 	logrus.WithFields(logrus.Fields{
 		"id":   s.id,
 		"type": s.config.SandboxType,
 	}).Info("正在创建沙箱...")
 
-	// 构建 HCS 配置
-	cfg, err := s.config.ToContainerConfig()
+	// 生成 HCS JSON 配置
+	configJSON, err := s.config.ToHCSJSON()
 	if err != nil {
 		return fmt.Errorf("构建配置失败: %w", err)
 	}
 
+	// 输出配置（调试模式）
+	logrus.Debugf("HCS 配置:\n%s", configJSON)
+
 	// 创建 compute system
-	s.container, err = hcsshim.CreateContainer(s.id, cfg)
+	s.system, err = CreateComputeSystemV2(s.id, configJSON)
 	if err != nil {
 		return fmt.Errorf("创建 compute system 失败: %w", err)
 	}
 
 	logrus.Info("正在启动沙箱...")
-	if err := s.container.Start(); err != nil {
-		s.container.Terminate()
+	if err := StartComputeSystem(s.system); err != nil {
+		TerminateComputeSystem(s.system)
 		return fmt.Errorf("启动沙箱失败: %w", err)
 	}
 
@@ -83,7 +89,7 @@ func (s *Sandbox) Execute(cmd string, args []string, timeout time.Duration) (*Ex
 		s.mu.Unlock()
 		return nil, fmt.Errorf("沙箱未启动")
 	}
-	container := s.container
+	system := s.system
 	s.mu.Unlock()
 
 	logrus.WithFields(logrus.Fields{
@@ -93,22 +99,16 @@ func (s *Sandbox) Execute(cmd string, args []string, timeout time.Duration) (*Ex
 
 	startTime := time.Now()
 
+	// 生成进程配置 JSON
+	processJSON := buildProcessConfigJSON(cmd, args, "")
+
 	// 创建进程
-	processConfig := buildProcessConfig(cmd, args, "")
-	process, err := container.CreateProcess(processConfig)
+	process, stdin, stdout, stderr, err := CreateProcessV2(system, processJSON)
 	if err != nil {
 		return nil, fmt.Errorf("创建进程失败: %w", err)
 	}
-	defer process.Close()
-
-	// 获取 stdin/stdout/stderr 管道
-	stdin, stdout, stderr, err := process.Stdio()
-	if err != nil {
-		return nil, fmt.Errorf("获取标准管道失败: %w", err)
-	}
-	defer stdin.Close()
-	defer stdout.Close()
-	defer stderr.Close()
+	defer CloseHandle(process)
+	defer CloseHandle(stdin)
 
 	// 异步读取 stdout 和 stderr
 	var stdoutBuf, stderrBuf []byte
@@ -118,35 +118,21 @@ func (s *Sandbox) Execute(cmd string, args []string, timeout time.Duration) (*Ex
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stdoutBuf, stdoutErr = io.ReadAll(stdout)
+		stdoutBuf, stdoutErr = ReadPipe(stdout)
+		CloseHandle(stdout)
 	}()
 	go func() {
 		defer wg.Done()
-		stderrBuf, stderrErr = io.ReadAll(stderr)
+		stderrBuf, stderrErr = ReadPipe(stderr)
+		CloseHandle(stderr)
 	}()
 
 	// 等待进程退出
-	var waitErr error
-	if timeout > 0 {
-		waitErr = process.WaitTimeout(timeout)
-	} else {
-		waitErr = process.Wait()
-	}
-
-	// 关闭管道以结束读取
-	stdin.Close()
-	stdout.Close()
-	stderr.Close()
+	exitCode, waitErr := WaitForProcessV2(system, process, timeout)
 
 	wg.Wait()
 
 	elapsed := time.Since(startTime)
-
-	// 获取退出码
-	exitCode := -1
-	if exitErr, err := process.ExitCode(); err == nil {
-		exitCode = exitErr
-	}
 
 	result := &ExecutionResult{
 		ExitCode: exitCode,
@@ -187,17 +173,14 @@ func (s *Sandbox) Terminate() error {
 
 	logrus.Info("正在终止沙箱...")
 
-	err := s.container.Shutdown()
+	err := TerminateComputeSystem(s.system)
 	if err != nil {
-		logrus.WithError(err).Warn("优雅关闭失败，强制终止...")
-		err = s.container.Terminate()
-	} else {
-		// 等待关闭完成
-		s.container.Wait()
+		logrus.WithError(err).Warn("终止沙箱时出错")
 	}
 
+	CloseHandle(s.system)
+	s.system = 0
 	s.running = false
-	s.container.Close()
 
 	logrus.Info("沙箱已终止")
 	return err
@@ -217,43 +200,18 @@ func (s *Sandbox) ID() string {
 
 // PrintConfig 打印 HCS JSON 配置（用于调试）
 func (s *Sandbox) PrintConfig() error {
-	cfg, err := s.config.ToContainerConfig()
+	jsonStr, err := s.config.ToHCSJSON()
 	if err != nil {
 		return err
 	}
-	// 简单输出配置信息
-	fmt.Printf("沙箱名称: %s\n", cfg.Name)
-	fmt.Printf("系统类型: %s\n", cfg.SystemType)
-	fmt.Printf("Hyper-V 分区: %v\n", cfg.HvPartition)
-	fmt.Printf("CPU 数量: %d\n", cfg.ProcessorCount)
-	fmt.Printf("最大内存: %d MB\n", cfg.MemoryMaximumInMB)
-	if cfg.HvRuntime != nil {
-		fmt.Printf("镜像路径: %s\n", cfg.HvRuntime.ImagePath)
-		fmt.Printf("内核文件: %s\n", cfg.HvRuntime.LinuxKernelFile)
-	}
-	if len(cfg.Layers) > 0 {
-		fmt.Printf("镜像层数: %d\n", len(cfg.Layers))
-		for i, layer := range cfg.Layers {
-			fmt.Printf("  层 %d: %s\n", i, layer.Path)
-		}
-	}
-	if len(cfg.MappedDirectories) > 0 {
-		fmt.Printf("共享目录:\n")
-		for _, dir := range cfg.MappedDirectories {
-			fmt.Printf("  %s -> %s (只读: %v)\n", dir.HostPath, dir.ContainerPath, dir.ReadOnly)
-		}
-	}
+	fmt.Println(jsonStr)
 	return nil
 }
 
 // CheckPrerequisites 检查运行前提条件
-// 注意：管理员权限检查已移至 EnsureAdmin()，通过 UAC 自动提权
 func CheckPrerequisites() error {
-	status := CheckComponents()
-
-	if !status.VmCompute {
-		return fmt.Errorf("vmcompute 服务不可用，请确保已启用容器功能")
+	if err := CheckHCSAPI(); err != nil {
+		return fmt.Errorf("HCS API 不可用: %w", err)
 	}
-
 	return nil
 }

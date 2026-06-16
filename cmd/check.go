@@ -62,6 +62,32 @@ func cmdCheck() error {
 		fmt.Println("  dism /online /enable-feature /featurename:Microsoft-Hyper-V /All")
 	}
 
+	// 诊断信息
+	fmt.Println()
+	fmt.Println("=== 诊断信息 ===")
+	fmt.Println()
+
+	// 检测到的路径
+	baseImage, err := sandbox.DetectBaseImage()
+	if err != nil {
+		fmt.Printf("  基础镜像: 未找到 (%v)\n", err)
+	} else {
+		fmt.Printf("  基础镜像: %s\n", baseImage)
+	}
+
+	// dump 一个示例 hyperv 配置
+	cfg := &sandbox.SandboxConfig{
+		Name:        "diagnostic",
+		SandboxType: sandbox.SandboxHyperV,
+		MemoryMB:    1024,
+		CPUs:        2,
+	}
+	if j, err := cfg.ToHCSJSON(); err == nil {
+		fmt.Println()
+		fmt.Println("  Hyper-V 模式示例配置:")
+		fmt.Printf("  %s\n", j)
+	}
+
 	return nil
 }
 
