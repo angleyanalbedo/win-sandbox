@@ -35,14 +35,21 @@ func cmdCheck() error {
 	// 检查 Hyper-V
 	printCheck("Hyper-V", status.HyperV)
 
-	// 检查各模式可用性
+	// 检查 Docker
 	fmt.Println()
-	fmt.Println("=== 沙箱模式可用性 ===")
+	fmt.Println("=== Docker 状态 ===")
 	fmt.Println()
-
-	printCheck("Hyper-V VM 模式 (hyperv)", status.BaseImage)
-	printCheck("Windows 容器模式 (container)", status.ContainerLayers)
-	printCheck("Linux 容器模式 (linux)", status.WSLKernel)
+	dockerMode, err := sandbox.CheckDockerMode()
+	if err != nil {
+		printCheck("Docker", false)
+		fmt.Printf("  %v\n", err)
+	} else {
+		printCheck("Docker", true)
+		fmt.Printf("  模式: %s\n", dockerMode)
+		if dockerMode != "windows" {
+			fmt.Println("  ⚠ 需要切换到 Windows 容器模式")
+		}
+	}
 
 	// 给出建议
 	fmt.Println()

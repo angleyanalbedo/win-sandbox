@@ -1,12 +1,13 @@
 package sandbox
 
 import (
+	"bytes"
 	"fmt"
-	"io"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/Microsoft/hcsshim"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 )
@@ -21,11 +22,10 @@ type ExecutionResult struct {
 
 // Sandbox 沙箱实例
 type Sandbox struct {
-	id        string
-	config    *SandboxConfig
-	container hcsshim.Container
-	running   bool
-	mu        sync.Mutex
+	id       string
+	config   *SandboxConfig
+	running  bool
+	mu       sync.Mutex
 }
 
 // New 创建新的沙箱实例
@@ -53,32 +53,63 @@ func (s *Sandbox) Start() error {
 		"type": s.config.SandboxType,
 	}).Info("正在创建沙箱...")
 
-	// 构建 hcsshim ContainerConfig
-	cfg, err := s.config.ToContainerConfig()
-	if err != nil {
-		return fmt.Errorf("构建配置失败: %w", err)
+	switch s.config.SandboxType {
+	case SandboxContainer:
+		return s.startDockerContainer()
+	default:
+		return fmt.Errorf("暂不支持 %s 模式，请使用 --sandbox-type container", s.config.SandboxType)
+	}
+}
+
+// startDockerContainer 使用 Docker 创建容器
+func (s *Sandbox) startDockerContainer() error {
+	// 检查 Docker 是否可用
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		return fmt.Errorf("Docker 不可用: %w", err)
 	}
 
-	// 调试：输出配置
-	logrus.WithFields(logrus.Fields{
-		"SystemType":  cfg.SystemType,
-		"HvPartition": cfg.HvPartition,
-		"MemoryMB":    cfg.MemoryMaximumInMB,
-		"CPUCount":    cfg.ProcessorCount,
-		"Layers":      len(cfg.Layers),
-		"HasHvRuntime": cfg.HvRuntime != nil,
-	}).Debug("ContainerConfig")
+	// 构建 docker create 参数
+	args := []string{"create", "--name", s.id}
 
-	// 创建 compute system
-	s.container, err = hcsshim.CreateContainer(s.id, cfg)
-	if err != nil {
-		return fmt.Errorf("创建 compute system 失败: %w", err)
+	// 资源限制
+	if s.config.MemoryMB > 0 {
+		args = append(args, "--memory", fmt.Sprintf("%dm", s.config.MemoryMB))
+	}
+	if s.config.CPUs > 0 {
+		args = append(args, "--cpus", fmt.Sprintf("%d", s.config.CPUs))
 	}
 
-	logrus.Info("正在启动沙箱...")
-	if err := s.container.Start(); err != nil {
-		s.container.Terminate()
-		return fmt.Errorf("启动沙箱失败: %w", err)
+	// 共享目录
+	for _, dir := range s.config.SharedDirs {
+		mount := fmt.Sprintf("%s:%s", dir.HostPath, dir.GuestPath)
+		if dir.ReadOnly {
+			mount += ":ro"
+		}
+		args = append(args, "-v", mount)
+	}
+
+	// 网络
+	if !s.config.EnableNetwork {
+		args = append(args, "--network", "none")
+	}
+
+	// 使用 nanoserver 作为基础镜像
+	args = append(args, "mcr.microsoft.com/windows/nanoserver:ltsc2022")
+
+	// 保持容器运行
+	args = append(args, "cmd", "/c", "ping", "-t", "localhost")
+
+	logrus.WithField("args", args).Debug("创建 Docker 容器")
+
+	out, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("创建容器失败: %s - %w", string(out), err)
+	}
+
+	// 启动容器
+	out, err = exec.Command("docker", "start", s.id).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("启动容器失败: %s - %w", string(out), err)
 	}
 
 	s.running = true
@@ -93,7 +124,7 @@ func (s *Sandbox) Execute(cmd string, args []string, timeout time.Duration) (*Ex
 		s.mu.Unlock()
 		return nil, fmt.Errorf("沙箱未启动")
 	}
-	container := s.container
+	containerID := s.id
 	s.mu.Unlock()
 
 	logrus.WithFields(logrus.Fields{
@@ -103,79 +134,44 @@ func (s *Sandbox) Execute(cmd string, args []string, timeout time.Duration) (*Ex
 
 	startTime := time.Now()
 
-	// 创建进程
-	processConfig := buildProcessConfig(cmd, args, "")
-	process, err := container.CreateProcess(processConfig)
-	if err != nil {
-		return nil, fmt.Errorf("创建进程失败: %w", err)
-	}
-	defer process.Close()
+	// 构建 docker exec 参数
+	execArgs := []string{"exec", containerID}
+	execArgs = append(execArgs, cmd)
+	execArgs = append(execArgs, args...)
 
-	// 获取 stdin/stdout/stderr 管道
-	stdin, stdout, stderr, err := process.Stdio()
-	if err != nil {
-		return nil, fmt.Errorf("获取标准管道失败: %w", err)
-	}
-	defer stdin.Close()
-	defer stdout.Close()
-	defer stderr.Close()
+	logrus.WithField("args", execArgs).Debug("执行命令")
 
-	// 异步读取 stdout 和 stderr
-	var stdoutBuf, stderrBuf []byte
-	var wg sync.WaitGroup
-	var stdoutErr, stderrErr error
+	// 执行命令
+	var stdout, stderr bytes.Buffer
+	execCmd := exec.Command("docker", execArgs...)
+	execCmd.Stdout = &stdout
+	execCmd.Stderr = &stderr
 
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		stdoutBuf, stdoutErr = io.ReadAll(stdout)
-	}()
-	go func() {
-		defer wg.Done()
-		stderrBuf, stderrErr = io.ReadAll(stderr)
-	}()
-
-	// 等待进程退出
-	var waitErr error
+	// 设置超时
 	if timeout > 0 {
-		waitErr = process.WaitTimeout(timeout)
-	} else {
-		waitErr = process.Wait()
+		timer := time.AfterFunc(timeout, func() {
+			execCmd.Process.Kill()
+		})
+		defer timer.Stop()
 	}
 
-	// 关闭管道以结束读取
-	stdin.Close()
-	stdout.Close()
-	stderr.Close()
-
-	wg.Wait()
-
+	err := execCmd.Run()
 	elapsed := time.Since(startTime)
 
-	// 获取退出码
-	exitCode := -1
-	if exitErr, err := process.ExitCode(); err == nil {
-		exitCode = exitErr
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return nil, fmt.Errorf("执行命令失败: %w", err)
+		}
 	}
 
 	result := &ExecutionResult{
 		ExitCode: exitCode,
-		Stdout:   string(stdoutBuf),
-		Stderr:   string(stderrBuf),
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
 		Elapsed:  elapsed,
-	}
-
-	if waitErr != nil {
-		if exitCode == -1 {
-			return result, fmt.Errorf("进程等待超时或失败: %w", waitErr)
-		}
-	}
-
-	if stdoutErr != nil {
-		logrus.WithError(stdoutErr).Warn("读取 stdout 失败")
-	}
-	if stderrErr != nil {
-		logrus.WithError(stderrErr).Warn("读取 stderr 失败")
 	}
 
 	logrus.WithFields(logrus.Fields{
@@ -197,19 +193,18 @@ func (s *Sandbox) Terminate() error {
 
 	logrus.Info("正在终止沙箱...")
 
-	err := s.container.Shutdown()
+	// 停止容器
+	exec.Command("docker", "stop", "-t", "0", s.id).Run()
+
+	// 删除容器
+	out, err := exec.Command("docker", "rm", "-f", s.id).CombinedOutput()
 	if err != nil {
-		logrus.WithError(err).Warn("优雅关闭失败，强制终止...")
-		err = s.container.Terminate()
-	} else {
-		s.container.Wait()
+		logrus.WithError(err).WithField("output", string(out)).Warn("删除容器失败")
 	}
 
 	s.running = false
-	s.container.Close()
-
 	logrus.Info("沙箱已终止")
-	return err
+	return nil
 }
 
 // IsRunning 沙箱是否正在运行
@@ -224,24 +219,17 @@ func (s *Sandbox) ID() string {
 	return s.id
 }
 
-// PrintConfig 打印 HCS 配置（用于调试）
+// PrintConfig 打印配置信息
 func (s *Sandbox) PrintConfig() error {
-	cfg, err := s.config.ToContainerConfig()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("SystemType:     %s\n", cfg.SystemType)
-	fmt.Printf("HvPartition:    %v\n", cfg.HvPartition)
-	fmt.Printf("ProcessorCount: %d\n", cfg.ProcessorCount)
-	fmt.Printf("MemoryMaximum:  %d MB\n", cfg.MemoryMaximumInMB)
-	if cfg.HvRuntime != nil {
-		fmt.Printf("HvRuntime.ImagePath:    %s\n", cfg.HvRuntime.ImagePath)
-		fmt.Printf("HvRuntime.SkipTemplate: %v\n", cfg.HvRuntime.SkipTemplate)
-	}
-	if len(cfg.Layers) > 0 {
-		fmt.Printf("Layers:\n")
-		for i, l := range cfg.Layers {
-			fmt.Printf("  [%d] ID=%s Path=%s\n", i, l.ID, l.Path)
+	fmt.Printf("沙箱名称:     %s\n", s.id)
+	fmt.Printf("沙箱类型:     %s\n", s.config.SandboxType)
+	fmt.Printf("CPU 数量:     %d\n", s.config.CPUs)
+	fmt.Printf("最大内存:     %d MB\n", s.config.MemoryMB)
+	fmt.Printf("网络:         %v\n", s.config.EnableNetwork)
+	if len(s.config.SharedDirs) > 0 {
+		fmt.Printf("共享目录:\n")
+		for _, dir := range s.config.SharedDirs {
+			fmt.Printf("  %s -> %s (只读: %v)\n", dir.HostPath, dir.GuestPath, dir.ReadOnly)
 		}
 	}
 	return nil
@@ -249,11 +237,18 @@ func (s *Sandbox) PrintConfig() error {
 
 // CheckPrerequisites 检查运行前提条件
 func CheckPrerequisites() error {
-	status := CheckComponents()
-
-	if !status.VmCompute {
-		return fmt.Errorf("vmcompute 服务不可用，请确保已启用容器功能")
+	// 检查 Docker
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		return fmt.Errorf("Docker 不可用，请确保 Docker 已安装并运行")
 	}
-
 	return nil
+}
+
+// CheckDockerMode 检查 Docker 是否在 Windows 容器模式
+func CheckDockerMode() (string, error) {
+	out, err := exec.Command("docker", "info", "--format", "{{.OSType}}").Output()
+	if err != nil {
+		return "", fmt.Errorf("获取 Docker 信息失败: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }

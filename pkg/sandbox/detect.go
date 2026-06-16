@@ -81,10 +81,21 @@ func DetectBaseImage() (string, error) {
 
 // DetectContainerLayers 检测 Windows 容器镜像层
 func DetectContainerLayers() ([]string, error) {
-	// 检查 Docker Desktop 层
-	dockerPath := filepath.Join(os.Getenv("ProgramData"), "DockerDesktop", "vm-data")
-	if _, err := os.Stat(dockerPath); err == nil {
-		return []string{dockerPath}, nil
+	// 检查 Docker 的 Windows 容器层存储（Docker Desktop Windows 容器模式）
+	dockerPaths := []string{
+		filepath.Join(os.Getenv("ProgramData"), "Docker", "windowsfilter"),
+		filepath.Join(os.Getenv("ProgramData"), "DockerDesktop", "vm-data"),
+	}
+	for _, dockerPath := range dockerPaths {
+		if entries, err := os.ReadDir(dockerPath); err == nil && len(entries) > 0 {
+			// 找到第一个目录作为层
+			for _, entry := range entries {
+				layerPath := filepath.Join(dockerPath, entry.Name())
+				if info, err := os.Stat(layerPath); err == nil && info.IsDir() {
+					return []string{layerPath}, nil
+				}
+			}
+		}
 	}
 
 	// 检查 Windows 容器基础镜像层
