@@ -247,12 +247,10 @@ func (s *Sandbox) PrintConfig() error {
 }
 
 // CheckPrerequisites 检查运行前提条件
+// 注意：管理员权限检查已移至 EnsureAdmin()，通过 UAC 自动提权
 func CheckPrerequisites() error {
 	status := CheckComponents()
 
-	if !status.Admin {
-		return fmt.Errorf("需要管理员权限运行此程序")
-	}
 	if !status.VmCompute {
 		return fmt.Errorf("vmcompute 服务不可用，请确保已启用容器功能")
 	}

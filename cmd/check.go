@@ -46,16 +46,20 @@ func cmdCheck() error {
 
 	// 给出建议
 	fmt.Println()
-	if !status.Admin {
-		fmt.Println("⚠ 请以管理员身份运行此程序")
+	fmt.Println("=== 权限说明 ===")
+	fmt.Println()
+	if status.Admin {
+		fmt.Println("  ✅ 当前以管理员权限运行")
+	} else {
+		fmt.Println("  ℹ  当前非管理员，run 命令会自动触发 UAC 提权")
 	}
 	if !status.VmCompute {
 		fmt.Println("⚠ 请确保已启用 Windows 容器功能:")
-		//   dism /online /enable-feature /featurename:Containers /All")
+		fmt.Println("  dism /online /enable-feature /featurename:Containers /All")
 	}
 	if !status.HyperV {
 		fmt.Println("⚠ 请确保已启用 Hyper-V:")
-		//   dism /online /enable-feature /featurename:Microsoft-Hyper-V /All")
+		fmt.Println("  dism /online /enable-feature /featurename:Microsoft-Hyper-V /All")
 	}
 
 	return nil

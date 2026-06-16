@@ -52,7 +52,12 @@ func cmdRun(command string, args []string) error {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	// 检查前提条件
+	// 自动 UAC 提权（如果不是管理员，会弹出 UAC 弹窗并重启进程）
+	if err := sandbox.EnsureAdmin(); err != nil {
+		return fmt.Errorf("提权失败: %w", err)
+	}
+
+	// 检查前提条件（此时已有管理员权限）
 	if err := sandbox.CheckPrerequisites(); err != nil {
 		return fmt.Errorf("前提条件检查失败: %w", err)
 	}
