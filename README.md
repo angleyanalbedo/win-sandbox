@@ -1,9 +1,9 @@
-## win-sandbox — Windows Sandbox 的开源 Rust 实现
+## win-sandbox — Windows Sandbox 的开源 Go 实现
 
-使用 Windows HCS (Host Compute System) API 创建轻量 Hyper-V VM，
-在 VM 内安全执行 .exe，完成后一次性销毁。
+使用 Microsoft HCS (Host Compute System) API 和 [hcsshim](https://github.com/microsoft/hcsshim) Go 库，
+创建轻量 Hyper-V VM 或 Windows 容器，在隔离环境中安全执行程序，完成后一次性销毁。
 
-**这就是 Windows Sandbox 内部使用的同一套 API（vmcompute.dll / hcsshim）。**
+**与 Windows Sandbox 使用同一套底层 API。**
 
 ### 前提条件
 
@@ -20,135 +20,103 @@ dism /online /enable-feature /featurename:Microsoft-Hyper-V /all
 # 需要重启
 ```
 
+### 安装
+
+```bash
+# 从源码编译
+go build -o wsandbox-vm.exe -ldflags="-s -w" .
+
+# 或下载 Release
+# https://github.com/angleyanalbedo/win-sandbox/releases
+```
+
 ### 快速开始
 
 ```powershell
 # 1. 检查环境
 wsandbox-vm check
 
-# 2. 在轻量 VM 中执行 exe
-wsandbox-vm run C:\path\to\program.exe arg1 arg2
+# 2. 在轻量 VM 中执行程序
+wsandbox-vm run -- cmd.exe /c echo Hello World
 
 # 3. 限制资源 + 启用网络
-wsandbox-vm run --memory 256 --cpus 1 --network --timeout 30 program.exe
+wsandbox-vm run -m 256 -c 1 --network -t 30s -- program.exe
 
-# 4. 查看生成的 HCS 配置（不执行，调试用）
+# 4. 共享目录
+wsandbox-vm run -s C:\data:C:\data -- dir C:\data
+
+# 5. 查看生成的配置（不执行，调试用）
 wsandbox-vm show-config --sandbox-type hyperv
 ```
 
 ### 架构
 
 ```
-┌─ Windows Host ──────────────────────────────────────┐
-│                                                      │
-│  wsandbox-vm (Rust)                                  │
-│  │                                                   │
-│  ├── HCS API (vmcompute.dll)                         │
-│  │   ├── HcsCreateComputeSystem   → 创建轻量 VM      │
-│  │   ├── HcsStartComputeSystem    → 启动 VM          │
-│  │   ├── HcsExecuteProcess        → 在 VM 内跑 exe   │
-│  │   ├── HcsWaitForProcess        → 等待结果         │
-│  │   └── HcsTerminateComputeSystem → 销毁 VM         │
-│  │                                                   │
-│  └── 配置生成器 (config.rs)                          │
-│      ├── Hyper-V VM 配置                             │
-│      ├── Windows Container 配置                      │
-│      └── Linux Container 配置                        │
-│                                                      │
-│  ┌─ Hyper-V 轻量 VM ─────────────────────────────┐  │
-│  │  独立内核 + 独立文件系统视图                     │  │
-│  │  ┌─ 你的 .exe ──────────────────────────────┐  │  │
-│  │  │  完全隔离，碰不到 Host                     │  │  │
-│  │  └──────────────────────────────────────────┘  │  │
-│  │  关闭即销毁，不留痕迹                           │  │
-│  └────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────┘
+┌─ Windows Host ──────────────────────────────────────────┐
+│                                                          │
+│  wsandbox-vm (Go + hcsshim)                             │
+│  │                                                       │
+│  ├── hcsshim.CreateContainer() → 创建 compute system     │
+│  ├── container.Start()         → 启动 VM / 容器          │
+│  ├── container.CreateProcess() → 在隔离环境内执行程序     │
+│  ├── process.Stdio()           → 捕获 stdin/stdout/stderr│
+│  ├── process.Wait()            → 等待退出                │
+│  └── container.Terminate()     → 销毁一切                │
+│                                                          │
+│  ┌─ Hyper-V 轻量 VM / Container ──────────────────────┐ │
+│  │  独立内核 + 独立文件系统视图                         │ │
+│  │  ┌─ 你的程序 ────────────────────────────────────┐  │ │
+│  │  │  完全隔离，碰不到 Host                         │  │ │
+│  │  └────────────────────────────────────────────────┘  │ │
+│  │  关闭即销毁，不留痕迹                                │ │
+│  └──────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### 三种沙箱模式
 
 ```powershell
 # 1. Hyper-V VM（最强隔离，最接近 Windows Sandbox）
-wsandbox-vm run --sandbox-type hyperv program.exe
+wsandbox-vm run --sandbox-type hyperv -- program.exe
 
 # 2. Windows Container（进程级隔离，更快启动）
-wsandbox-vm run --sandbox-type container program.exe
+wsandbox-vm run --sandbox-type container -- program.exe
 
 # 3. Linux Container（通过 WSL2 Hyper-V 后端）
-wsandbox-vm run --sandbox-type linux /bin/ls
+wsandbox-vm run --sandbox-type linux -- /bin/ls
 ```
 
 ### 项目结构
 
 ```
 win-sandbox/
-├── Cargo.toml
-├── src/
-│   ├── main.rs      # CLI 入口（clap 子命令）
-│   ├── hcs.rs       # HCS API FFI 绑定（vmcompute.dll）
-│   ├── config.rs    # HCS JSON 配置生成器
-│   └── sandbox.rs   # VM 生命周期管理（创建→启动→执行→销毁）
+├── main.go                    # 程序入口
+├── cmd/
+│   ├── root.go               # 根命令定义
+│   ├── run.go                # run 子命令
+│   ├── check.go              # check 子命令
+│   └── showconfig.go         # show-config 子命令
+├── pkg/
+│   └── sandbox/
+│       ├── sandbox.go        # 沙箱生命周期管理
+│       ├── config.go         # HCS 配置生成
+│       └── detect.go         # 基础镜像/内核检测
+├── go.mod
+├── LICENSE
+└── README.md
 ```
 
-### 工作原理
+### 技术栈
 
-与 Windows Sandbox 完全相同的底层流程：
-
-```
-1. HcsCreateComputeSystem(config_json)
-   → 创建一个轻量 Hyper-V VM
-   → 使用差分磁盘（基础层共享 Host 系统文件，只存改动）
-   → 内存可超分配（按需分配，不预占）
-
-2. HcsStartComputeSystem()
-   → 启动 VM（通常 2-5 秒）
-
-3. HcsExecuteProcess(exe_path, args)
-   → 在 VM 内启动进程
-   → 通过管道连接 stdin/stdout/stderr
-
-4. HcsWaitForProcessInComputeSystem(timeout)
-   → 等待执行完成或超时
-   → 收集退出码和执行统计
-
-5. HcsTerminateComputeSystem()
-   → 销毁 VM
-   → 删除差分磁盘
-   → 清理临时文件
-   → 什么都不留
-```
-
-### 开发路线
-
-**v0.1（当前）**
-- HCS API FFI 绑定
-- VM 生命周期管理（创建→启动→执行→销毁）
-- 三种沙箱模式配置（HyperV / Container / Linux）
-- 环境检测（check 命令）
-
-**v0.2（计划中）**
-- stdout/stderr 管道捕获（通过 Named Pipe 连接 HcsExecuteProcess 返回的 I/O 句柄）
-- 差分磁盘支持（共享 Host 基础镜像，只存 Guest 改动）
-- 共享目录挂载（Host 目录 → VM 内路径）
-- 网络控制（域名白名单 / 完全禁止）
-
-**v0.3（计划中）**
-- 与 wasmtime-agent-sandbox 统一 CLI 入口
-- 策略文件复用（同一份 YAML 配置 Wasm 和 VM 两种模式）
-- 审计日志对接
+- **[hcsshim](https://github.com/microsoft/hcsshim)** — 微软官方 HCS Go 库
+- **[cobra](https://github.com/spf13/cobra)** — CLI 框架
+- **[logrus](https://github.com/sirupsen/logrus)** — 日志库
 
 ### 参考
 
 - [hcsshim](https://github.com/microsoft/hcsshim) — 微软官方的 HCS Go 绑定（Apache-2.0）
 - [HCS Schema](https://learn.microsoft.com/en-us/virtualization/api/hcs/resourceschemaversion2) — 配置 Schema 文档
 - [Windows Sandbox 架构](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-architecture)
-
-### 局限性
-
-- 需要 Windows Pro/Enterprise（Home 版不支持 Hyper-V）
-- 需要管理员权限
-- HCS API 不在公开 Win32 文档中，Schema 可能随 Windows 版本变化
-- stdout/stderr 管道捕获需要额外实现（当前版本仅获取退出码）
 
 ### License
 

@@ -1,0 +1,70 @@
+package cmd
+
+import (
+	"fmt"
+
+	"github.com/angleyanalbedo/win-sandbox/pkg/sandbox"
+	"github.com/spf13/cobra"
+)
+
+var checkCmd = &cobra.Command{
+	Use:   "check",
+	Short: "检查系统环境和组件可用性",
+	Long:  `检查 Windows 版本、Hyper-V 状态、vmcompute 服务、管理员权限以及各沙箱模式所需的基础镜像。`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return cmdCheck()
+	},
+}
+
+func init() {
+	rootCmd.AddCommand(checkCmd)
+}
+
+func cmdCheck() error {
+	fmt.Println("=== win-sandbox 环境检查 ===")
+	fmt.Println()
+
+	status := sandbox.CheckComponents()
+
+	// 检查管理员权限
+	printCheck("管理员权限", status.Admin)
+
+	// 检查 vmcompute 服务
+	printCheck("vmcompute 服务", status.VmCompute)
+
+	// 检查 Hyper-V
+	printCheck("Hyper-V", status.HyperV)
+
+	// 检查各模式可用性
+	fmt.Println()
+	fmt.Println("=== 沙箱模式可用性 ===")
+	fmt.Println()
+
+	printCheck("Hyper-V VM 模式 (hyperv)", status.BaseImage)
+	printCheck("Windows 容器模式 (container)", status.ContainerLayers)
+	printCheck("Linux 容器模式 (linux)", status.WSLKernel)
+
+	// 给出建议
+	fmt.Println()
+	if !status.Admin {
+		fmt.Println("⚠ 请以管理员身份运行此程序")
+	}
+	if !status.VmCompute {
+		fmt.Println("⚠ 请确保已启用 Windows 容器功能:")
+		//   dism /online /enable-feature /featurename:Containers /All")
+	}
+	if !status.HyperV {
+		fmt.Println("⚠ 请确保已启用 Hyper-V:")
+		//   dism /online /enable-feature /featurename:Microsoft-Hyper-V /All")
+	}
+
+	return nil
+}
+
+func printCheck(name string, ok bool) {
+	status := "❌ 不可用"
+	if ok {
+		status = "✅ 可用"
+	}
+	fmt.Printf("  %-30s %s\n", name, status)
+}

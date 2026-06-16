@@ -1,5 +1,6 @@
-# Rust build artifacts
-/target/
+# Go build artifacts
+wsandbox-vm.exe
+wsandbox-vm
 
 # IDE
 .vscode/
