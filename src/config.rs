@@ -307,14 +307,22 @@ pub fn detect_base_image() -> String {
     }
 
     // 2. 搜索 ContainerStorages 下的 sandbox.vhdx（Windows Sandbox 功能安装后生成）
+    //    优先选最大的文件（完整的基础镜像通常 500MB+）
     let container_storages = r"C:\ProgramData\Microsoft\Windows\Containers\ContainerStorages";
+    let mut best_vhdx: Option<(String, u64)> = None;
     if let Ok(entries) = std::fs::read_dir(container_storages) {
         for entry in entries.flatten() {
             let vhdx = entry.path().join("sandbox.vhdx");
             if vhdx.exists() {
-                return vhdx.to_string_lossy().to_string();
+                let size = std::fs::metadata(&vhdx).map(|m| m.len()).unwrap_or(0);
+                if best_vhdx.as_ref().is_none_or(|(_, s)| size > *s) {
+                    best_vhdx = Some((vhdx.to_string_lossy().to_string(), size));
+                }
             }
         }
+    }
+    if let Some((path, _)) = best_vhdx {
+        return path;
     }
 
     // 3. 检查 Hyper-V 默认路径下是否有基础镜像

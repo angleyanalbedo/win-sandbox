@@ -121,14 +121,17 @@ type FnCoTaskMemFree = unsafe extern "system" fn(ptr: *mut c_void);
 
 // ── 动态加载 ──
 
-/// vmcompute.dll 的函数表，运行时通过 LoadLibraryW + GetProcAddress 加载
+/// HCS API 函数表，运行时从 vmcompute.dll + computecore.dll 动态加载
+///
+/// 不同 Windows 版本的 DLL 布局不同，部分函数可能不存在。
+/// 可选函数用 Option 标记，必选函数加载失败则报错。
 struct HcsApi {
     _lib: windows::Win32::Foundation::HMODULE,
     HcsCreateComputeSystem: FnHcsCreateComputeSystem,
     HcsStartComputeSystem: FnHcsStartComputeSystem,
     HcsTerminateComputeSystem: FnHcsTerminateComputeSystem,
-    HcsPauseComputeSystem: FnHcsPauseComputeSystem,
-    HcsResumeComputeSystem: FnHcsResumeComputeSystem,
+    HcsPauseComputeSystem: Option<FnHcsPauseComputeSystem>,
+    HcsResumeComputeSystem: Option<FnHcsResumeComputeSystem>,
     HcsGetComputeSystemProperties: FnHcsGetComputeSystemProperties,
     HcsExecuteProcess: FnHcsExecuteProcess,
     HcsWaitForProcessInComputeSystem: FnHcsWaitForProcessInComputeSystem,
@@ -136,7 +139,7 @@ struct HcsApi {
     HcsCreateOperation: FnHcsCreateOperation,
     HcsCloseOperation: FnHcsCloseOperation,
     HcsWaitForOperationResult: FnHcsWaitForOperationResult,
-    HcsGetOperationContext: FnHcsGetOperationContext,
+    HcsGetOperationContext: Option<FnHcsGetOperationContext>,
     CoTaskMemFree: FnCoTaskMemFree,
 }
 
@@ -157,41 +160,87 @@ unsafe fn get_proc<F: Copy>(
     );
     match addr {
         Some(f) => Ok(std::mem::transmute_copy(&f)),
-        None => anyhow::bail!("vmcompute.dll 缺少函数: {}", name),
+        None => anyhow::bail!("缺少函数: {}", name),
     }
 }
 
-/// 加载 vmcompute.dll 并获取所有函数指针
+/// 从多个 DLL 中尝试获取函数指针
+unsafe fn get_proc_from_any<F: Copy>(
+    libs: &[windows::Win32::Foundation::HMODULE],
+    name: &str,
+) -> anyhow::Result<F> {
+    for lib in libs {
+        let name_c = std::ffi::CString::new(name)?;
+        let addr = windows::Win32::System::LibraryLoader::GetProcAddress(
+            *lib,
+            windows::core::PCSTR(name_c.as_ptr() as _),
+        );
+        if let Some(f) = addr {
+            return Ok(std::mem::transmute_copy(&f));
+        }
+    }
+    anyhow::bail!("所有 DLL 中均缺少函数: {}", name)
+}
+
+/// 加载 HCS API 函数指针（兼容新旧版本 DLL 布局）
+///
+/// Windows 10/11 不同版本的 HCS 函数分布在不同 DLL 中：
+/// - vmcompute.dll: 核心 VM/容器管理（旧版也有全部函数）
+/// - computecore.dll: 新版拆分出的操作和进程函数
+///
+/// 这里从两个 DLL 中搜索，找到就用，兼容新旧系统。
 fn load_hcs_api() -> anyhow::Result<HcsApi> {
+    use windows::Win32::Foundation::GetLastError;
     use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
-    // 先尝试完整路径，再尝试系统搜索
-    let lib = unsafe { LoadLibraryW(windows::core::w!("C:\\Windows\\System32\\vmcompute.dll")) }
-        .or_else(|_| unsafe { LoadLibraryW(windows::core::w!("vmcompute.dll")) })
+    let lib1 = unsafe { LoadLibraryW(windows::core::w!("C:\\Windows\\System32\\vmcompute.dll")) }
         .map_err(|e| {
+            let err_code = unsafe { GetLastError() };
             anyhow::anyhow!(
-                "无法加载 vmcompute.dll: {}\n  尝试路径: C:\\Windows\\System32\\vmcompute.dll\n  请确认 Hyper-V 功能已启用，且 vmcompute 服务正在运行",
-                e
+                "无法加载 vmcompute.dll: {} (错误码: 0x{:08X})\n  请确认 Hyper-V 已启用且以管理员权限运行",
+                e, err_code.0
             )
         })?;
 
+    // computecore.dll 可能不存在于旧系统，允许失败
+    let lib2 = unsafe { LoadLibraryW(windows::core::w!("C:\\Windows\\System32\\computecore.dll")) };
+    let _has_lib2 = lib2.is_ok();
+
+    // ole32.dll 提供 CoTaskMemFree
+    let lib_ole32 = unsafe { LoadLibraryW(windows::core::w!("ole32.dll")) };
+
+    // 收集所有可用的 DLL 句柄用于搜索函数
+    let mut libs = vec![lib1];
+    if let Ok(l) = lib2 {
+        libs.push(l);
+    }
+    if let Ok(l) = lib_ole32 {
+        libs.push(l);
+    }
+
     unsafe {
         Ok(HcsApi {
-            _lib: lib,
-            HcsCreateComputeSystem: get_proc(lib, "HcsCreateComputeSystem")?,
-            HcsStartComputeSystem: get_proc(lib, "HcsStartComputeSystem")?,
-            HcsTerminateComputeSystem: get_proc(lib, "HcsTerminateComputeSystem")?,
-            HcsPauseComputeSystem: get_proc(lib, "HcsPauseComputeSystem")?,
-            HcsResumeComputeSystem: get_proc(lib, "HcsResumeComputeSystem")?,
-            HcsGetComputeSystemProperties: get_proc(lib, "HcsGetComputeSystemProperties")?,
-            HcsExecuteProcess: get_proc(lib, "HcsExecuteProcess")?,
-            HcsWaitForProcessInComputeSystem: get_proc(lib, "HcsWaitForProcessInComputeSystem")?,
-            HcsGetProcessProperties: get_proc(lib, "HcsGetProcessProperties")?,
-            HcsCreateOperation: get_proc(lib, "HcsCreateOperation")?,
-            HcsCloseOperation: get_proc(lib, "HcsCloseOperation")?,
-            HcsWaitForOperationResult: get_proc(lib, "HcsWaitForOperationResult")?,
-            HcsGetOperationContext: get_proc(lib, "HcsGetOperationContext")?,
-            CoTaskMemFree: get_proc(lib, "CoTaskMemFree")?,
+            _lib: lib1,
+            HcsCreateComputeSystem: get_proc_from_any(&libs, "HcsCreateComputeSystem")?,
+            HcsStartComputeSystem: get_proc_from_any(&libs, "HcsStartComputeSystem")?,
+            HcsTerminateComputeSystem: get_proc_from_any(&libs, "HcsTerminateComputeSystem")?,
+            HcsPauseComputeSystem: get_proc_from_any(&libs, "HcsPauseComputeSystem").ok(),
+            HcsResumeComputeSystem: get_proc_from_any(&libs, "HcsResumeComputeSystem").ok(),
+            HcsGetComputeSystemProperties: get_proc_from_any(&libs, "HcsGetComputeSystemProperties")?,
+            // 新版 API: HcsCreateProcess 替代 HcsExecuteProcess
+            HcsExecuteProcess: get_proc_from_any(&libs, "HcsExecuteProcess")
+                .or_else(|_| get_proc_from_any(&libs, "HcsCreateProcess"))
+                .map_err(|_| anyhow::anyhow!("找不到 HcsExecuteProcess 或 HcsCreateProcess"))?,
+            // 新版 API: HcsOpenProcess 替代 HcsWaitForProcessInComputeSystem
+            HcsWaitForProcessInComputeSystem: get_proc_from_any(&libs, "HcsWaitForProcessInComputeSystem")
+                .or_else(|_| get_proc_from_any(&libs, "HcsOpenProcess"))
+                .map_err(|_| anyhow::anyhow!("找不到 HcsWaitForProcessInComputeSystem 或 HcsOpenProcess"))?,
+            HcsGetProcessProperties: get_proc_from_any(&libs, "HcsGetProcessProperties")?,
+            HcsCreateOperation: get_proc_from_any(&libs, "HcsCreateOperation")?,
+            HcsCloseOperation: get_proc_from_any(&libs, "HcsCloseOperation")?,
+            HcsWaitForOperationResult: get_proc_from_any(&libs, "HcsWaitForOperationResult")?,
+            HcsGetOperationContext: get_proc_from_any(&libs, "HcsGetOperationContext").ok(),
+            CoTaskMemFree: get_proc_from_any(&libs, "CoTaskMemFree")?,
         })
     }
 }
@@ -409,6 +458,25 @@ pub unsafe fn co_task_mem_free(ptr: *mut c_void) {
 /// 检查 vmcompute.dll 是否可用
 pub fn is_available() -> bool {
     api().is_ok()
+}
+
+/// 获取详细的加载错误信息（用于诊断）
+pub fn load_error_detail() -> String {
+    match api() {
+        Ok(_) => String::new(),
+        Err(e) => {
+            let vmcompute = std::path::Path::new(r"C:\Windows\System32\vmcompute.dll");
+            let computecore = std::path::Path::new(r"C:\Windows\System32\computecore.dll");
+            format!(
+                "{}\n  vmcompute.dll 存在: {} ({} bytes)\n  computecore.dll 存在: {}\n  进程架构: {}bit",
+                e,
+                vmcompute.exists(),
+                if vmcompute.exists() { std::fs::metadata(vmcompute).map(|m| m.len()).unwrap_or(0) } else { 0 },
+                computecore.exists(),
+                std::mem::size_of::<usize>() * 8
+            )
+        }
+    }
 }
 
 // ── Windows 管道 I/O ──

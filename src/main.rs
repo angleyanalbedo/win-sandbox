@@ -479,6 +479,10 @@ fn cmd_check() -> Result<()> {
         eprintln!("{} vmcompute.dll: 可加载", "✓".green());
     } else {
         eprintln!("{} vmcompute.dll: 无法加载", "✗".red());
+        let detail = hcs::load_error_detail();
+        for line in detail.lines() {
+            eprintln!("  {}", line.dimmed());
+        }
     }
 
     // 6. 各模式可用性
