@@ -7,6 +7,39 @@ import (
 	"strings"
 )
 
+// detectUVMImage 检测 Utility VM 镜像（Hyper-V 隔离容器需要）
+func detectUVMImage() (string, error) {
+	// Utility VM 镜像通常在 Windows 容器基础镜像安装目录中
+	candidates := []string{
+		filepath.Join(os.Getenv("ProgramFiles"), "Linux Containers"),
+		filepath.Join(os.Getenv("ProgramFiles"), "Windows Containers"),
+		filepath.Join(os.Getenv("ProgramData"), "Microsoft", "Windows", "Containers", "BaseImages"),
+	}
+
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		// 查找 Utility VM VHDX
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			name := strings.ToLower(info.Name())
+			if strings.HasSuffix(name, ".vhdx") || strings.HasSuffix(name, ".iso") {
+				// Utility VM 镜像通常名为 utilityvm.vhdx 或 uvm.vhdx
+				if strings.Contains(name, "utilityvm") || strings.Contains(name, "uvm") {
+					return filepath.SkipAll
+				}
+			}
+			return nil
+		})
+	}
+
+	// 回退：查找任何可用的容器基础镜像
+	return DetectBaseImage()
+}
+
 // DetectBaseImage 检测 Hyper-V 基础镜像（sandbox.vhdx 或 Windows Server 镜像）
 func DetectBaseImage() (string, error) {
 	candidates := []string{

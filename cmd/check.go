@@ -62,21 +62,11 @@ func cmdCheck() error {
 		fmt.Println("  dism /online /enable-feature /featurename:Microsoft-Hyper-V /All")
 	}
 
-	// HCS API 状态
-	fmt.Println()
-	fmt.Println("=== HCS API 状态 ===")
-	fmt.Println()
-	apiStatus := sandbox.HCSAPIStatus()
-	for name, ok := range apiStatus {
-		printCheck(name, ok)
-	}
-
 	// 诊断信息
 	fmt.Println()
 	fmt.Println("=== 诊断信息 ===")
 	fmt.Println()
 
-	// 检测到的路径
 	baseImage, err := sandbox.DetectBaseImage()
 	if err != nil {
 		fmt.Printf("  基础镜像: 未找到 (%v)\n", err)
@@ -84,17 +74,21 @@ func cmdCheck() error {
 		fmt.Printf("  基础镜像: %s\n", baseImage)
 	}
 
-	// dump 一个示例 hyperv 配置
+	// 显示 ContainerConfig 示例
 	cfg := &sandbox.SandboxConfig{
 		Name:        "diagnostic",
 		SandboxType: sandbox.SandboxHyperV,
 		MemoryMB:    1024,
 		CPUs:        2,
 	}
-	if j, err := cfg.ToHCSJSON(); err == nil {
-		fmt.Println()
-		fmt.Println("  Hyper-V 模式示例配置:")
-		fmt.Printf("  %s\n", j)
+	if cc, err := cfg.ToContainerConfig(); err != nil {
+		fmt.Printf("  Hyper-V 配置: %v\n", err)
+	} else {
+		fmt.Printf("  Hyper-V 配置: SystemType=%s HvPartition=%v Layers=%d\n",
+			cc.SystemType, cc.HvPartition, len(cc.Layers))
+		if cc.HvRuntime != nil {
+			fmt.Printf("  HvRuntime.ImagePath: %s\n", cc.HvRuntime.ImagePath)
+		}
 	}
 
 	return nil

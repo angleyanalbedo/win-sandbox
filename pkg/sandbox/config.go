@@ -1,11 +1,12 @@
 package sandbox
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Microsoft/hcsshim"
 )
 
 // SandboxType 沙箱类型
@@ -37,243 +38,184 @@ type SandboxConfig struct {
 	Verbose       bool
 }
 
-// ToHCSJSON 生成 HCS v2 JSON 配置文档
-func (c *SandboxConfig) ToHCSJSON() (string, error) {
+// ToContainerConfig 将沙箱配置转换为 hcsshim ContainerConfig
+func (c *SandboxConfig) ToContainerConfig() (*hcsshim.ContainerConfig, error) {
 	switch c.SandboxType {
 	case SandboxHyperV:
-		return c.hypervVMConfig()
+		return c.hypervConfig()
 	case SandboxContainer:
-		return c.windowsContainerConfig()
+		return c.containerConfig()
 	case SandboxLinux:
-		return c.linuxContainerConfig()
+		return c.linuxConfig()
 	default:
-		return "", fmt.Errorf("不支持的沙箱类型: %s", c.SandboxType)
+		return nil, fmt.Errorf("不支持的沙箱类型: %s", c.SandboxType)
 	}
 }
 
-// hypervVMConfig 生成 Hyper-V 虚拟机 v2 JSON（与 Rust 版本一致）
-func (c *SandboxConfig) hypervVMConfig() (string, error) {
-	baseImage, err := DetectBaseImage()
+// hypervConfig 构建 Hyper-V 隔离容器配置
+func (c *SandboxConfig) hypervConfig() (*hcsshim.ContainerConfig, error) {
+	// 检测 Utility VM 镜像（不是 sandbox.vhdx 本体）
+	uvmImage, err := detectUVMImage()
 	if err != nil {
-		return "", fmt.Errorf("未找到 Hyper-V 基础镜像: %w", err)
+		return nil, fmt.Errorf("未找到 Utility VM 镜像: %w\n提示: 请先安装 Windows 容器功能或 Docker Desktop", err)
 	}
 
-	// 构建 v2 schema 的 HCS JSON（与 Rust 版本的 config.rs 一致）
-	config := map[string]interface{}{
-		"SchemaVersion": map[string]interface{}{
-			"Major": 2,
-			"Minor": 1,
-		},
-		"Owner": "win-sandbox",
-		"ShouldTerminateOnLastHandleClosed": true,
-		"VirtualMachine": map[string]interface{}{
-			"StopOnReset": true,
-			"Chipset": map[string]interface{}{},
-			"ComputeTopology": map[string]interface{}{
-				"Memory": map[string]interface{}{
-					"SizeInMB": c.MemoryMB,
-					"AllowOvercommit": true,
-				},
-				"Processor": map[string]interface{}{
-					"Count": c.CPUs,
-				},
-			},
-			"Devices": map[string]interface{}{
-				"SCSI": map[string]interface{}{
-					"0": map[string]interface{}{
-						"Attachments": c.buildSCSIAttachments(baseImage),
-					},
-				},
-			},
-		},
-	}
-
-	// 添加共享目录（MappedDirectories 在 Devices 下）
-	if len(c.SharedDirs) > 0 {
-		var mappedDirs []map[string]interface{}
-		for _, dir := range c.SharedDirs {
-			mappedDirs = append(mappedDirs, map[string]interface{}{
-				"HostPath":      dir.HostPath,
-				"ContainerPath": dir.GuestPath,
-				"ReadOnly":      dir.ReadOnly,
-			})
-		}
-		devices := config["VirtualMachine"].(map[string]interface{})["Devices"].(map[string]interface{})
-		devices["MappedDirectories"] = mappedDirs
-	}
-
-	// 添加网络配置
-	if c.EnableNetwork {
-		networkConfig := map[string]interface{}{
-			"MaxSocketPortCount":  65535,
-			"MaxPartitionSocketConnectionCount": 1024,
-		}
-		if len(c.AllowDomains) > 0 {
-			networkConfig["DNSSearchList"] = strings.Join(c.AllowDomains, ",")
-		}
-		config["GuestNetwork"] = networkConfig
-	}
-
-	jsonBytes, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("JSON 序列化失败: %w", err)
-	}
-	return string(jsonBytes), nil
-}
-
-// buildSCSIAttachments 构建 SCSI 附件（支持差分磁盘）
-func (c *SandboxConfig) buildSCSIAttachments(baseImage string) map[string]interface{} {
-	attachments := map[string]interface{}{
-		"0": map[string]interface{}{
-			"Path": baseImage,
-			"Type": "VirtualDisk",
-		},
-	}
-
-	if c.DiffDisk != "" {
-		attachments["1"] = map[string]interface{}{
-			"Path": c.DiffDisk,
-			"Type": "VirtualDisk",
-		}
-	}
-
-	return attachments
-}
-
-// windowsContainerConfig 生成 Windows 容器配置（使用 hcsshim v1 API）
-func (c *SandboxConfig) windowsContainerConfig() (string, error) {
+	// 检测容器镜像层
 	layers, err := DetectContainerLayers()
 	if err != nil {
-		return "", fmt.Errorf("未找到容器镜像层: %w", err)
+		return nil, fmt.Errorf("未找到容器镜像层: %w\n提示: 请先安装 Windows 容器基础镜像", err)
 	}
 
-	type Layer struct {
-		ID   string `json:"Id"`
-		Path string
-	}
-	var hcsLayers []Layer
+	var hcsLayers []hcsshim.Layer
 	for i, layer := range layers {
-		hcsLayers = append(hcsLayers, Layer{
+		hcsLayers = append(hcsLayers, hcsshim.Layer{
 			ID:   fmt.Sprintf("layer-%d", i),
 			Path: layer,
 		})
 	}
 
-	config := map[string]interface{}{
-		"SystemType":              "Container",
-		"Name":                    c.Name,
-		"HvPartition":             false,
-		"IgnoreFlushesDuringBoot": true,
-		"ProcessorCount":          c.CPUs,
-		"MemoryMaximumInMB":       c.MemoryMB,
-		"TerminateOnLastHandleClosed": true,
-		"Layers":                  hcsLayers,
+	cfg := &hcsshim.ContainerConfig{
+		SystemType:              "Container",
+		Name:                    c.Name,
+		HvPartition:             true,
+		IgnoreFlushesDuringBoot: true,
+		ProcessorCount:          uint32(c.CPUs),
+		MemoryMaximumInMB:       int64(c.MemoryMB),
+		TerminateOnLastHandleClosed: true,
+		Layers:    hcsLayers,
+		HvRuntime: &hcsshim.HvRuntime{
+			ImagePath:    uvmImage,
+			SkipTemplate: true,
+		},
 	}
 
-	if len(c.SharedDirs) > 0 {
-		var mappedDirs []map[string]interface{}
-		for _, dir := range c.SharedDirs {
-			mappedDirs = append(mappedDirs, map[string]interface{}{
-				"HostPath":      dir.HostPath,
-				"ContainerPath": dir.GuestPath,
-				"ReadOnly":      dir.ReadOnly,
-			})
+	// 共享目录
+	for _, dir := range c.SharedDirs {
+		cfg.MappedDirectories = append(cfg.MappedDirectories, hcsshim.MappedDir{
+			HostPath:      dir.HostPath,
+			ContainerPath: dir.GuestPath,
+			ReadOnly:      dir.ReadOnly,
+		})
+	}
+
+	// 网络
+	if c.EnableNetwork {
+		cfg.EndpointList = []string{}
+		if len(c.AllowDomains) > 0 {
+			cfg.DNSSearchList = strings.Join(c.AllowDomains, ",")
+			cfg.AllowUnqualifiedDNSQuery = true
 		}
-		config["MappedDirectories"] = mappedDirs
+	}
+
+	return cfg, nil
+}
+
+// containerConfig 构建 Windows 进程隔离容器配置
+func (c *SandboxConfig) containerConfig() (*hcsshim.ContainerConfig, error) {
+	layers, err := DetectContainerLayers()
+	if err != nil {
+		return nil, fmt.Errorf("未找到容器镜像层: %w", err)
+	}
+
+	var hcsLayers []hcsshim.Layer
+	for i, layer := range layers {
+		hcsLayers = append(hcsLayers, hcsshim.Layer{
+			ID:   fmt.Sprintf("layer-%d", i),
+			Path: layer,
+		})
+	}
+
+	cfg := &hcsshim.ContainerConfig{
+		SystemType:              "Container",
+		Name:                    c.Name,
+		HvPartition:             false,
+		IgnoreFlushesDuringBoot: true,
+		ProcessorCount:          uint32(c.CPUs),
+		MemoryMaximumInMB:       int64(c.MemoryMB),
+		TerminateOnLastHandleClosed: true,
+		Layers: hcsLayers,
+	}
+
+	for _, dir := range c.SharedDirs {
+		cfg.MappedDirectories = append(cfg.MappedDirectories, hcsshim.MappedDir{
+			HostPath:      dir.HostPath,
+			ContainerPath: dir.GuestPath,
+			ReadOnly:      dir.ReadOnly,
+		})
 	}
 
 	if c.EnableNetwork {
-		config["EndpointList"] = []string{}
+		cfg.EndpointList = []string{}
 		if len(c.AllowDomains) > 0 {
-			config["DNSSearchList"] = strings.Join(c.AllowDomains, ",")
-			config["AllowUnqualifiedDNSQuery"] = true
+			cfg.DNSSearchList = strings.Join(c.AllowDomains, ",")
+			cfg.AllowUnqualifiedDNSQuery = true
 		}
 	}
 
-	jsonBytes, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("JSON 序列化失败: %w", err)
-	}
-	return string(jsonBytes), nil
+	return cfg, nil
 }
 
-// linuxContainerConfig 生成 Linux 容器配置
-func (c *SandboxConfig) linuxContainerConfig() (string, error) {
+// linuxConfig 构建 Linux 容器配置
+func (c *SandboxConfig) linuxConfig() (*hcsshim.ContainerConfig, error) {
 	kernelPath, err := DetectWSLKernel()
 	if err != nil {
-		return "", fmt.Errorf("未找到 WSL 内核: %w", err)
+		return nil, fmt.Errorf("未找到 WSL 内核: %w", err)
 	}
 
 	initrdPath := ""
 	initrdDir := filepath.Dir(kernelPath)
-	candidates := []string{
-		filepath.Join(initrdDir, "initrd.img"),
-		filepath.Join(initrdDir, "initrd"),
-	}
-	for _, p := range candidates {
+	for _, name := range []string{"initrd.img", "initrd"} {
+		p := filepath.Join(initrdDir, name)
 		if _, err := os.Stat(p); err == nil {
 			initrdPath = p
 			break
 		}
 	}
 
-	hvRuntime := map[string]interface{}{
-		"LinuxKernelFile": kernelPath,
+	cfg := &hcsshim.ContainerConfig{
+		SystemType:              "Container",
+		Name:                    c.Name,
+		HvPartition:             true,
+		IgnoreFlushesDuringBoot: true,
+		ProcessorCount:          uint32(c.CPUs),
+		MemoryMaximumInMB:       int64(c.MemoryMB),
+		TerminateOnLastHandleClosed: true,
+		HvRuntime: &hcsshim.HvRuntime{
+			LinuxKernelFile: kernelPath,
+		},
 	}
 	if initrdPath != "" {
-		hvRuntime["LinuxInitrdFile"] = initrdPath
+		cfg.HvRuntime.LinuxInitrdFile = initrdPath
 	}
 
-	config := map[string]interface{}{
-		"SystemType":              "Container",
-		"Name":                    c.Name,
-		"HvPartition":             true,
-		"IgnoreFlushesDuringBoot": true,
-		"ProcessorCount":          c.CPUs,
-		"MemoryMaximumInMB":       c.MemoryMB,
-		"TerminateOnLastHandleClosed": true,
-		"HvRuntime":               hvRuntime,
-	}
-
-	if len(c.SharedDirs) > 0 {
-		var mappedDirs []map[string]interface{}
-		for _, dir := range c.SharedDirs {
-			mappedDirs = append(mappedDirs, map[string]interface{}{
-				"HostPath":      dir.HostPath,
-				"ContainerPath": dir.GuestPath,
-				"ReadOnly":      dir.ReadOnly,
-			})
-		}
-		config["MappedDirectories"] = mappedDirs
+	for _, dir := range c.SharedDirs {
+		cfg.MappedDirectories = append(cfg.MappedDirectories, hcsshim.MappedDir{
+			HostPath:      dir.HostPath,
+			ContainerPath: dir.GuestPath,
+			ReadOnly:      dir.ReadOnly,
+		})
 	}
 
 	if c.EnableNetwork {
-		config["EndpointList"] = []string{}
+		cfg.EndpointList = []string{}
 	}
 
-	jsonBytes, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("JSON 序列化失败: %w", err)
-	}
-	return string(jsonBytes), nil
+	return cfg, nil
 }
 
-// buildProcessConfigJSON 生成进程执行配置 JSON
-func buildProcessConfigJSON(cmd string, args []string, workDir string) string {
+// buildProcessConfig 构建进程执行配置
+func buildProcessConfig(cmd string, args []string, workDir string) *hcsshim.ProcessConfig {
 	commandLine := cmd
 	if len(args) > 0 {
 		commandLine = cmd + " " + strings.Join(args, " ")
 	}
 
-	config := map[string]interface{}{
-		"CommandLine":      commandLine,
-		"WorkingDirectory": workDir,
-		"CreateStdInPipe":  true,
-		"CreateStdOutPipe": true,
-		"CreateStdErrPipe": true,
-		"ConsoleSize":      [2]uint{25, 80},
+	return &hcsshim.ProcessConfig{
+		CommandLine:      commandLine,
+		WorkingDirectory: workDir,
+		CreateStdInPipe:  true,
+		CreateStdOutPipe: true,
+		CreateStdErrPipe: true,
+		ConsoleSize:      [2]uint{25, 80},
 	}
-
-	jsonBytes, _ := json.Marshal(config)
-	return string(jsonBytes)
 }
