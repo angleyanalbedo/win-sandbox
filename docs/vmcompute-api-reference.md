@@ -566,7 +566,67 @@ type HcsError struct {
 
 ---
 
-## 10. 文件索引
+## 10. 层存储兼容性（重要）
+
+### Windows 上有两套路层存储，互不兼容
+
+| 存储位置 | 管理者 | hcsshim 兼容 | 说明 |
+| --- | --- | --- | --- |
+| `C:\ProgramData\Microsoft\Windows\Containers\Layers\` | Windows Servicing Stack | **不兼容** | 系统自带，缺少 filter driver 元数据 |
+| `C:\ProgramData\Docker\windowsfilter\` | WCIFS filter driver | **兼容** | Docker/containerd 创建，格式正确 |
+
+### 为什么不兼容
+
+系统自带的层（Windows 容器功能安装时创建）：
+
+- 有 `Files\` 和 `Hives\` 目录
+- **没有** `layerchain.json` 文件
+- **没有** 经过 WCIFS filter driver 注册
+- `hcsshim.CreateScratchLayer` 无法识别这些层 → 报错 `0x3`
+
+Docker 的层：
+
+- 通过 filter driver API 创建和注册
+- 有完整的元数据（`layerchain.json` 等）
+- `hcsshim` 可以正常操作
+
+### 正确的层操作流程
+
+```text
+1. CreateScratchLayer → 创建 scratch 目录和 sandbox.vhdx
+2. ActivateLayer → 激活 scratch 层（不是基础层！）
+3. PrepareLayer → 准备 scratch 层，传入基础层路径作为父层
+4. GetLayerMountPath → 获取 scratch 的 volume GUID path
+5. ContainerConfig → 设置 VolumePath 和 LayerFolderPath
+```
+
+### 如何获取兼容的层
+
+```bash
+# 方法 1：用 Docker 拉取镜像（推荐）
+docker pull mcr.microsoft.com/windows/nanoserver:ltsc2022
+# 层存储在 C:\ProgramData\Docker\windowsfilter\
+
+# 方法 2：用 containerd 拉取
+ctr images pull mcr.microsoft.com/windows/nanoserver:ltsc2022
+```
+
+### 诊断脚本
+
+```powershell
+# 检查环境状态
+powershell -ExecutionPolicy Bypass -File scripts\check_env.ps1
+
+# 检查系统层
+powershell -ExecutionPolicy Bypass -File scripts\check_layers.ps1
+
+# 检查 Docker 层（需要管理员）
+powershell -ExecutionPolicy Bypass -File scripts\check_docker_layers.ps1
+```
+
+---
+
+## 11. 文件索引
 
 | 文件 | 作用 |
 |------|------|
