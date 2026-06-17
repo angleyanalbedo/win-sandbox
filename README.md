@@ -90,6 +90,7 @@ hcsshim 的层操作 API 只能操作 WCIFS filter driver 管理的层。
 
 - [vmcompute API 参考](docs/vmcompute-api-reference.md) — Windows HCS 底层 API 完整参考
 - [hcsshim API 分层](docs/hcsshim-api-layers.md) — hcsshim 库的四层架构分析
+- [hcsshim 内部 API](docs/hcsshim-internal-api.md) — hcsoci、layers、uvm 等高级 API 详解
 - [hcsshim cmd 工具](docs/hcsshim-cmd-reference.md) — hcsshim 仓库中各工具的用途说明
 - [Docker 镜像存储](docs/docker-image-storage.md) — Docker 在 Windows 上的镜像存储结构
 - [问题排查记录](docs/troubleshooting.md) — 开发过程中遇到的问题和解决方案
