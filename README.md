@@ -31,18 +31,25 @@ go build -o win-sandbox.exe .
 
 ## 项目结构
 
-```
+```text
 win-sandbox/
 ├── main.go                          # 入口
 ├── go.mod                           # Go 模块定义
+├── pkg/
+│   └── docker/
+│       ├── layers.go                # Docker 镜像层查找函数
+│       └── layers_test.go           # 测试
 ├── docs/
 │   ├── vmcompute-api-reference.md   # vmcompute.dll API 参考
-│   └── hcsshim-api-layers.md        # hcsshim API 分层参考
+│   ├── hcsshim-api-layers.md        # hcsshim API 分层参考
+│   ├── docker-image-storage.md      # Docker 镜像存储结构
+│   └── troubleshooting.md           # 问题排查记录
 ├── scripts/
 │   ├── README.md                    # 脚本说明
 │   ├── check_env.ps1                # 环境诊断
 │   ├── check_layers.ps1             # 系统层检查
 │   ├── check_docker_layers.ps1      # Docker 层检查
+│   ├── find_docker_layers.ps1       # 查找 Docker 层
 │   └── export_layers.ps1            # 导出层
 └── hcsshim/                         # hcsshim 源码（git submodule，参考用）
 ```
@@ -83,6 +90,8 @@ hcsshim 的层操作 API 只能操作 WCIFS filter driver 管理的层。
 
 - [vmcompute API 参考](docs/vmcompute-api-reference.md) — Windows HCS 底层 API 完整参考
 - [hcsshim API 分层](docs/hcsshim-api-layers.md) — hcsshim 库的四层架构分析
+- [Docker 镜像存储](docs/docker-image-storage.md) — Docker 在 Windows 上的镜像存储结构
+- [问题排查记录](docs/troubleshooting.md) — 开发过程中遇到的问题和解决方案
 
 ## 许可证
 
