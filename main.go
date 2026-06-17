@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,19 +83,30 @@ func main() {
 
 	// 8. 构建容器配置
 	containerID := "sandbox-" + uuid.New().String()[:8]
-	containerCfg := &hcsshim.ContainerConfig{
-		SystemType:              "Container",
-		Name:                    "win-sandbox",
-		HvPartition:             false,
-		VolumePath:              volumePath,
-		LayerFolderPath:         scratchPath,
-		ProcessorCount:          2,
-		MemoryMaximumInMB:       1024,
-		TerminateOnLastHandleClosed: true,
-		Layers: []hcsshim.Layer{
-			{ID: filepath.Base(baseLayer.Path), Path: baseLayer.Path},
-		},
+
+	// HCS 要求 Layer 列表只包含只读层（不含 scratch）
+	// ID 需要是从目录名生成的 GUID（hcsshim 内部用 NameToGuid 转换）
+	dirName := filepath.Base(baseLayer.Path)
+	guid := hcsshim.NewGUID(dirName)
+	fmt.Printf("Layer GUID: %s (from: %s)\n", guid.ToString(), dirName)
+	hcsLayers := []hcsshim.Layer{
+		{ID: guid.ToString(), Path: baseLayer.Path},
 	}
+
+	// 和 hcsshim 测试代码保持一致的配置
+	containerCfg := &hcsshim.ContainerConfig{
+		SystemType:      "Container",
+		Name:            "win-sandbox",
+		HvPartition:     false,
+		VolumePath:      volumePath,
+		LayerFolderPath: scratchPath,
+		Layers:          hcsLayers,
+	}
+
+	// 打印实际配置（调试用）
+	cfgJSON, _ := json.MarshalIndent(containerCfg, "", "  ")
+	fmt.Println("=== ContainerConfig ===")
+	fmt.Println(string(cfgJSON))
 
 	// 9. 创建容器
 	fmt.Println("正在创建容器...")
