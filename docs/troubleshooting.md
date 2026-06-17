@@ -2,6 +2,48 @@
 
 开发 win-sandbox 过程中遇到的问题、原因、解决方案。
 
+## 根本原因总结
+
+hcsshim 没有文档，所有坑都是读源码和试错才发现的。三个核心问题：
+
+### 问题 1：Layer ID 必须是 GUID，不能是目录名
+
+```go
+// 错误：直接用目录名
+{ID: "d643449f9e57...", Path: "..."}     // HCS 报 parameter incorrect
+
+// 正确：用 NameToGuid 算法生成的 GUID
+{ID: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", Path: "..."}  // HCS 接受
+```
+
+`NameToGuid` 是 hcsshim 内部算法，把目录名 hash 成 GUID。HCS 只接受这种格式。
+代码：`hcsshim.NewGUID(dirName).ToString()`
+
+### 问题 2：两套路层存储互不兼容
+
+```text
+系统层：Containers\Layers\       ← Servicing Stack 管理，hcsshim 不认识
+Docker层：Docker\windowsfilter\  ← WCIFS filter driver 管理，hcsshim 认识
+```
+
+同样的 `Files\` 和 `Hives\` 目录结构，但底层元数据不同。
+hcsshim 的 filter driver API 只认 WCIFS 管理的层。
+
+### 问题 3：scratch 层是激活对象，不是基础层
+
+```go
+// 错误：激活基础层
+ActivateLayer(baseLayerID)       // 失败
+
+// 正确：激活 scratch 层，基础层只是父层引用
+ActivateLayer(scratchID)
+PrepareLayer(scratchID, []string{baseLayerPath})
+```
+
+HCS 的层管理模型：scratch 是可写层（激活对象），基础层是只读层（父层引用）。
+
+---
+
 ## 1. CreateScratchLayer 报错 0x3 (The system cannot find the path specified)
 
 ### 现象
