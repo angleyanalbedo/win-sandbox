@@ -89,6 +89,7 @@ hcsshim 的层操作 API 只能操作 WCIFS filter driver 管理的层。
 ## 文档
 
 - [hcsshim 公开 API](docs/hcsshim-public-api.md) — 外部项目可用的全部 API 参考
+- [hcsshim API 调用关系](docs/hcsshim-api-relationships.md) — API 之间的依赖关系和调用链
 - [hcsshim 内部 API](docs/hcsshim-internal-api.md) — hcsoci、layers、uvm 等高级 API 详解
 - [hcsshim API 分层](docs/hcsshim-api-layers.md) — hcsshim 库的四层架构分析
 - [hcsshim cmd 工具](docs/hcsshim-cmd-reference.md) — hcsshim 仓库中各工具的用途说明
