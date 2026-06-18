@@ -233,9 +233,31 @@ func TestPullManifest(t *testing.T) {
 	fmt.Printf("MediaType: %s\n", manifest.MediaType)
 	fmt.Printf("Config digest: %s\n", manifest.Config.Digest)
 	fmt.Printf("层数: %d\n", len(manifest.Layers))
+	fmt.Printf("Manifests (多平台): %d\n", len(manifest.Manifests))
 
-	for i, layer := range manifest.Layers {
-		fmt.Printf("  层 %d: %s (size: %d)\n", i, layer.Digest[:20]+"...", layer.Size)
+	// 如果是 manifest list，获取具体平台的 manifest
+	if len(manifest.Manifests) > 0 {
+		fmt.Println("\n检测到多平台镜像，获取具体 manifest...")
+		for i, m := range manifest.Manifests {
+			fmt.Printf("  [%d] digest: %s, mediaType: %s\n", i, m.Digest[:20]+"...", m.MediaType)
+		}
+
+		// 获取第一个 manifest
+		platformManifest, err := client.fetchManifestByDigest(ctx, registry, repo, manifest.Manifests[0].Digest)
+		if err != nil {
+			t.Fatalf("获取平台 manifest 失败: %v", err)
+		}
+		fmt.Printf("\n平台 Manifest:\n")
+		fmt.Printf("  MediaType: %s\n", platformManifest.MediaType)
+		fmt.Printf("  Config: %s\n", platformManifest.Config.Digest)
+		fmt.Printf("  层数: %d\n", len(platformManifest.Layers))
+		for i, layer := range platformManifest.Layers {
+			fmt.Printf("    层 %d: %s (size: %d bytes)\n", i, layer.Digest[:20]+"...", layer.Size)
+		}
+	} else {
+		for i, layer := range manifest.Layers {
+			fmt.Printf("  层 %d: %s (size: %d)\n", i, layer.Digest[:20]+"...", layer.Size)
+		}
 	}
 }
 

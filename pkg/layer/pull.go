@@ -12,25 +12,11 @@ import (
 
 // OCI Manifest 结构
 type Manifest struct {
-	SchemaVersion int              `json:"schemaVersion"`
-	MediaType     string           `json:"mediaType"`
-	Config        Descriptor       `json:"config"`
-	Layers        []Descriptor     `json:"layers"`
-	// ManifestList 多平台镜像的 manifest list
-	Manifests     []Descriptor     `json:"manifests,omitempty"`
-}
-
-// Platform 平台信息
-type Platform struct {
-	Architecture string `json:"architecture"`
-	OS           string `json:"os"`
-	Variant      string `json:"variant,omitempty"`
-}
-
-// ManifestListEntry manifest list 中的条目
-type ManifestListEntry struct {
-	Descriptor
-	Platform Platform `json:"platform"`
+	SchemaVersion int          `json:"schemaVersion"`
+	MediaType     string       `json:"mediaType"`
+	Config        Descriptor   `json:"config"`
+	Layers        []Descriptor `json:"layers"`
+	Manifests     []Descriptor `json:"manifests,omitempty"` // manifest list
 }
 
 // Descriptor 描述一个 blob
