@@ -65,6 +65,9 @@ func createSandbox() error {
 		return err
 	}
 
+	// 释放句柄（TerminateOnLastHandleClosed=false，容器继续运行）
+	defer sb.Close()
+
 	fmt.Printf("沙箱已创建: %s\n", sb.ID())
 	fmt.Printf("使用 'win-sandbox exec %s <command>' 执行命令\n", sb.ID())
 	fmt.Printf("使用 'win-sandbox delete %s' 销毁沙箱\n", sb.ID())

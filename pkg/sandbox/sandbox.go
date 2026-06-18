@@ -90,7 +90,7 @@ func (s *Sandbox) Create() error {
 		LayerFolderPath:             mount.ScratchPath,
 		ProcessorCount:              uint32(s.config.CPUs),
 		MemoryMaximumInMB:           int64(s.config.MemoryMB),
-		TerminateOnLastHandleClosed: true,
+		TerminateOnLastHandleClosed: false,
 		Layers:                      hcsLayers,
 	}
 
