@@ -10,7 +10,7 @@ import (
 var rootCmd = &cobra.Command{
 	Use:   "win-sandbox",
 	Short: "Windows 沙箱工具",
-	Long:  "基于 HCS API 的 Windows 容器沙箱工具，用于在隔离环境中执行命令。",
+	Long:  "基于 HCS API 的 Windows 容器沙箱工具，支持持久化沙箱和一次性命令执行。",
 }
 
 // Execute 执行根命令

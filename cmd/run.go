@@ -9,22 +9,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	image   string
-	memory  int
-	cpus    int
-	network string
-	timeout time.Duration
-	verbose bool
-)
-
 var runCmd = &cobra.Command{
-	Use:   "run [command]",
-	Short: "在沙箱中执行命令",
-	Long:  "创建一个隔离的 Windows 容器沙箱，并在其中执行指定命令。",
+	Use:   "run <command> [args...]",
+	Short: "一次性执行命令（创建→执行→销毁）",
+	Long:  "创建临时沙箱，执行命令后自动销毁。等价于 create + exec + delete。",
 	Args:  cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runInSandbox(args)
+		command := args[0]
+		if len(args) > 1 {
+			for _, a := range args[1:] {
+				command += " " + a
+			}
+		}
+		return runInSandbox(command)
 	},
 }
 
@@ -38,7 +35,7 @@ func init() {
 	rootCmd.AddCommand(runCmd)
 }
 
-func runInSandbox(args []string) error {
+func runInSandbox(command string) error {
 	// 构建沙箱选项
 	opts := []sandbox.Option{
 		sandbox.WithImage(image),
@@ -49,9 +46,9 @@ func runInSandbox(args []string) error {
 		sandbox.WithVerbose(verbose),
 	}
 
-	// 创建沙箱
+	// 创建临时沙箱（不持久化状态）
 	sb := sandbox.New(opts...)
-	defer sb.Close()
+	defer sb.Destroy()
 
 	if verbose {
 		fmt.Printf("沙箱 ID: %s\n", sb.ID())
@@ -72,13 +69,6 @@ func runInSandbox(args []string) error {
 	}
 
 	// 执行命令
-	command := args[0]
-	if len(args) > 1 {
-		for _, a := range args[1:] {
-			command += " " + a
-		}
-	}
-
 	if verbose {
 		fmt.Printf("执行命令: %s\n", command)
 	}
