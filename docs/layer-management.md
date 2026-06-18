@@ -356,7 +356,7 @@ Files/Windows/.wh.deleted.txt    ← 白障：表示 deleted.txt 已被删除
 ## 三套 API 完整对照表
 
 | 能力 | hcsshim（根包） | computestorage | ociwclayer |
-|------|---------------|----------------|------------|
+| --- | --- | --- | --- |
 | 文件夹导入导出 | ✅ | ✅ | ❌ |
 | Tar 流导入导出 | ❌ | ❌ | ✅ |
 | 创建空层 | ✅ `CreateLayer()` | ❌ | ❌ |
