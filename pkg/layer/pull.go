@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -15,6 +16,21 @@ type Manifest struct {
 	MediaType     string           `json:"mediaType"`
 	Config        Descriptor       `json:"config"`
 	Layers        []Descriptor     `json:"layers"`
+	// ManifestList 多平台镜像的 manifest list
+	Manifests     []Descriptor     `json:"manifests,omitempty"`
+}
+
+// Platform 平台信息
+type Platform struct {
+	Architecture string `json:"architecture"`
+	OS           string `json:"os"`
+	Variant      string `json:"variant,omitempty"`
+}
+
+// ManifestListEntry manifest list 中的条目
+type ManifestListEntry struct {
+	Descriptor
+	Platform Platform `json:"platform"`
 }
 
 // Descriptor 描述一个 blob
@@ -34,13 +50,15 @@ type ImageConfig struct {
 
 // RegistryClient OCI Registry 客户端
 type RegistryClient struct {
-	client *http.Client
+	client  *http.Client
+	tokens  map[string]string // registry -> token 缓存
 }
 
 // NewRegistryClient 创建 Registry 客户端
 func NewRegistryClient() *RegistryClient {
 	return &RegistryClient{
 		client: &http.Client{},
+		tokens: make(map[string]string),
 	}
 }
 
@@ -68,6 +86,16 @@ func (c *RegistryClient) Pull(ctx context.Context, store *Store, imageName strin
 	manifest, err := c.fetchManifest(ctx, registry, repository, tag)
 	if err != nil {
 		return nil, fmt.Errorf("获取 manifest 失败: %w", err)
+	}
+
+	// 如果是 manifest list（多平台），需要获取特定平台的 manifest
+	if manifest.MediaType == "application/vnd.oci.image.index.v1+json" ||
+		manifest.MediaType == "application/vnd.docker.distribution.manifest.list.v2+json" {
+		// 查找 windows/amd64 平台
+		manifest, err = c.resolveManifestList(ctx, registry, repository, manifest)
+		if err != nil {
+			return nil, fmt.Errorf("解析 manifest list 失败: %w", err)
+		}
 	}
 
 	// 2. 获取镜像配置（获取 diff_id 列表）
@@ -125,6 +153,101 @@ func (c *RegistryClient) Pull(ctx context.Context, store *Store, imageName strin
 	}, nil
 }
 
+// doRequest 执行 HTTP 请求，自动处理认证
+func (c *RegistryClient) doRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
+	// 如果有缓存的 token，先加上
+	if token, ok := c.tokens[req.URL.Host]; ok {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 如果返回 401，尝试获取 token 并重试
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+
+		token, err := c.fetchToken(ctx, resp, req.URL.String())
+		if err != nil {
+			return nil, fmt.Errorf("获取认证 token 失败: %w", err)
+		}
+		c.tokens[req.URL.Host] = token
+
+		// 重试请求
+		req.Header.Set("Authorization", "Bearer "+token)
+		return c.client.Do(req)
+	}
+
+	return resp, nil
+}
+
+// fetchToken 从 Www-Authenticate 头获取 token
+func (c *RegistryClient) fetchToken(ctx context.Context, resp *http.Response, originalURL string) (string, error) {
+	// 解析 Www-Authenticate 头
+	// 格式: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/hello-world:pull"
+	authHeader := resp.Header.Get("Www-Authenticate")
+	if authHeader == "" {
+		return "", fmt.Errorf("响应中没有 Www-Authenticate 头")
+	}
+
+	realm := ""
+	service := ""
+	scope := ""
+
+	re := regexp.MustCompile(`realm="([^"]+)"`)
+	if matches := re.FindStringSubmatch(authHeader); len(matches) > 1 {
+		realm = matches[1]
+	}
+
+	re = regexp.MustCompile(`service="([^"]+)"`)
+	if matches := re.FindStringSubmatch(authHeader); len(matches) > 1 {
+		service = matches[1]
+	}
+
+	re = regexp.MustCompile(`scope="([^"]+)"`)
+	if matches := re.FindStringSubmatch(authHeader); len(matches) > 1 {
+		scope = matches[1]
+	}
+
+	if realm == "" {
+		return "", fmt.Errorf("无法解析 realm")
+	}
+
+	// 构建 token 请求
+	tokenURL := fmt.Sprintf("%s?service=%s&scope=%s", realm, service, scope)
+	req, err := http.NewRequestWithContext(ctx, "GET", tokenURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	tokenResp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token 请求失败: HTTP %d", tokenResp.StatusCode)
+	}
+
+	var tokenData struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenData); err != nil {
+		return "", err
+	}
+
+	token := tokenData.Token
+	if token == "" {
+		token = tokenData.AccessToken
+	}
+
+	return token, nil
+}
+
 // fetchManifest 获取镜像 manifest
 func (c *RegistryClient) fetchManifest(ctx context.Context, registry, repository, tag string) (*Manifest, error) {
 	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, tag)
@@ -135,7 +258,7 @@ func (c *RegistryClient) fetchManifest(ctx context.Context, registry, repository
 	}
 	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json")
 
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +285,7 @@ func (c *RegistryClient) fetchConfig(ctx context.Context, registry, repository, 
 		return nil, err
 	}
 
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +312,7 @@ func (c *RegistryClient) fetchBlob(ctx context.Context, registry, repository, di
 		return nil, err
 	}
 
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -206,34 +329,52 @@ func (c *RegistryClient) fetchBlob(ctx context.Context, registry, repository, di
 // 输入: mcr.microsoft.com/windows/nanoserver:ltsc2022
 // 输出: registry=mcr.microsoft.com, repository=windows/nanoserver, tag=ltsc2022
 func parseImageName(imageName string) (registry, repository, tag string) {
-	// 分离 tag
-	parts := strings.SplitN(imageName, ":", 2)
-	if len(parts) == 2 {
-		tag = parts[1]
-	} else {
-		tag = "latest"
-	}
-	name := parts[0]
+	// 先找第一个 / 分离 registry 和 repository
+	slashIdx := strings.Index(imageName, "/")
 
-	// 分离 registry 和 repository
-	slashIdx := strings.Index(name, "/")
 	if slashIdx == -1 {
-		// 没有 /，是 Docker Hub 官方镜像
+		// 没有 /，是 Docker Hub 官方镜像（可能带 tag）
+		name, t := splitTag(imageName)
 		registry = "registry-1.docker.io"
 		repository = "library/" + name
+		tag = t
 		return
 	}
 
-	potentialRegistry := name[:slashIdx]
-	if strings.Contains(potentialRegistry, ".") || strings.Contains(potentialRegistry, ":") || potentialRegistry == "localhost" {
-		// 有 . 或 : 或是 localhost，是 registry 地址
+	potentialRegistry := imageName[:slashIdx]
+	rest := imageName[slashIdx+1:]
+
+	// 判断 potentialRegistry 是否是 registry 地址
+	if isRegistry(potentialRegistry) {
 		registry = potentialRegistry
-		repository = name[slashIdx+1:]
+		repository, tag = splitTag(rest)
 	} else {
-		// 没有 .，是 Docker Hub 用户镜像
+		// 不是 registry，整体是 Docker Hub 的 repository
 		registry = "registry-1.docker.io"
-		repository = name
+		repository, tag = splitTag(imageName)
 	}
 
 	return
+}
+
+// splitTag 分离镜像名和 tag
+// nanoserver:ltsc2022 → nanoserver, ltsc2022
+// nanoserver → nanoserver, latest
+func splitTag(name string) (string, string) {
+	// 从右边找 :（避免误匹配 host:port 中的冒号）
+	// 但 tag 的 : 后面不应该有 /
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == ':' {
+			potentialTag := name[i+1:]
+			if !strings.Contains(potentialTag, "/") {
+				return name[:i], potentialTag
+			}
+		}
+	}
+	return name, "latest"
+}
+
+// isRegistry 判断是否是 registry 地址（包含 . 或 : 或是 localhost）
+func isRegistry(s string) bool {
+	return strings.Contains(s, ".") || strings.Contains(s, ":") || s == "localhost"
 }
