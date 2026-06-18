@@ -153,6 +153,56 @@ func (c *RegistryClient) Pull(ctx context.Context, store *Store, imageName strin
 	}, nil
 }
 
+// resolveManifestList 从 manifest list 中解析出特定平台的 manifest
+func (c *RegistryClient) resolveManifestList(ctx context.Context, registry, repository string, list *Manifest) (*Manifest, error) {
+	// OCI manifest list 中的 Descriptor 不包含 platform 信息
+	// 直接尝试每个 manifest，找到可用的（通常是 windows/amd64）
+	if len(list.Manifests) == 0 {
+		return nil, fmt.Errorf("manifest list 为空")
+	}
+
+	// 尝试每个 manifest，找到可用的
+	for _, m := range list.Manifests {
+		manifest, err := c.fetchManifestByDigest(ctx, registry, repository, m.Digest)
+		if err != nil {
+			continue
+		}
+		if len(manifest.Layers) > 0 {
+			return manifest, nil
+		}
+	}
+
+	return nil, fmt.Errorf("未找到可用的 manifest")
+}
+
+// fetchManifestByDigest 通过 digest 获取 manifest
+func (c *RegistryClient) fetchManifestByDigest(ctx context.Context, registry, repository, digest string) (*Manifest, error) {
+	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, digest)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json")
+
+	resp, err := c.doRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	var manifest Manifest
+	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+		return nil, err
+	}
+
+	return &manifest, nil
+}
+
 // doRequest 执行 HTTP 请求，自动处理认证
 func (c *RegistryClient) doRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
 	// 如果有缓存的 token，先加上
@@ -184,7 +234,7 @@ func (c *RegistryClient) doRequest(ctx context.Context, req *http.Request) (*htt
 }
 
 // fetchToken 从 Www-Authenticate 头获取 token
-func (c *RegistryClient) fetchToken(ctx context.Context, resp *http.Response, originalURL string) (string, error) {
+func (c *RegistryClient) fetchToken(ctx context.Context, resp *http.Response, _ string) (string, error) {
 	// 解析 Www-Authenticate 头
 	// 格式: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/hello-world:pull"
 	authHeader := resp.Header.Get("Www-Authenticate")
