@@ -287,6 +287,7 @@ func (c *RegistryClient) fetchToken(ctx context.Context, resp *http.Response, _ 
 // fetchManifest 获取镜像 manifest
 func (c *RegistryClient) fetchManifest(ctx context.Context, registry, repository, tag string) (*Manifest, error) {
 	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, tag)
+	fmt.Printf("  [DEBUG] fetchManifest: %s\n", url) // 调试
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
